@@ -17,6 +17,13 @@ var errEmptyArgv = errors.New("probe command is empty")
 // the code and the last non-empty stderr line. Cancelling ctx kills the process
 // and the returned error matches errors.Is against ctx.Err().
 func Measure(ctx context.Context, argv []string) ([]Record, error) {
+	return MeasureIn(ctx, "", argv)
+}
+
+// MeasureIn is Measure with a working directory for the probe. The dotfiles
+// probe resolves its own paths from the checkout root, so a caller that does
+// not run there passes the root as dir. An empty dir means the current one.
+func MeasureIn(ctx context.Context, dir string, argv []string) ([]Record, error) {
 	if len(argv) == 0 || argv[0] == "" {
 		return nil, errEmptyArgv
 	}
@@ -25,6 +32,7 @@ func Measure(ctx context.Context, argv []string) ([]Record, error) {
 	args = append(args, "--json")
 
 	cmd := exec.CommandContext(ctx, argv[0], args...)
+	cmd.Dir = dir
 	var stdout, stderr bytes.Buffer
 	cmd.Stdout = &stdout
 	cmd.Stderr = &stderr
