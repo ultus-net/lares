@@ -38,6 +38,7 @@ Everything else queues, with the precondition that blocked it:
 | `needs-operator` | the repair writes to a remote or needs a judgement call |
 | `unverified` | the probe returned `unknown`, so no repair is safe |
 | `hold` | a live hold is blocking disruptive work |
+| `scan` | `/proc` could not be read, so an unclaimed agent cannot be ruled out |
 | `fix-did-not-hold` | the repair ran and verification saw no movement |
 | `backoff` | the item is due, but its retry delay has not elapsed |
 | `deferred` | the operator moved it out |
@@ -101,7 +102,8 @@ can_reboot = window_open AND no_hold AND no_interactive_session AND no_own_job
 | Term | Blocks when |
 | --- | --- |
 | `window` | the local clock is outside `window_start`-`window_end` |
-| `hold` | any live hold exists, a live `opencode`/`orca` process has none, or `/proc` cannot be scanned |
+| `hold` | any live hold exists, or a live `opencode`/`orca` process has none |
+| `scan` | `/proc` could not be read, so no agent could be ruled out |
 | `session` | a session other than the user's manager is logged in, Omarchy's stay-awake marker exists, or `loginctl` cannot answer |
 | `own-job` | an update transaction is running, or its state cannot be read |
 

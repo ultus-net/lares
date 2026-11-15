@@ -221,8 +221,12 @@ func (e *Engine) Pass(ctx context.Context) (Result, error) {
 		return result, err
 	}
 	// A failed process scan cannot prove that no agent is running, so it holds
-	// the work just as a live hold does.
+	// the work just as a live hold does, under its own term.
 	unclaimed, scanErr := e.unclaimedAgents(holds)
+	heldTerm := termHold
+	if scanErr != nil {
+		heldTerm = termScan
+	}
 	held := len(holds) > 0 || scanErr != nil || len(unclaimed) > 0
 
 	next := state.Queue{Generation: previous.Generation}
@@ -261,7 +265,7 @@ func (e *Engine) Pass(ctx context.Context) (Result, error) {
 			continue
 		}
 		if held {
-			item.Term = termHold
+			item.Term = heldTerm
 			next.Items = append(next.Items, item)
 			result.Skipped = append(result.Skipped, rec.ID)
 			continue

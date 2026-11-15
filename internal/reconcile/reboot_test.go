@@ -239,8 +239,8 @@ func TestRebootFailsClosedWhenTheAgentScanFails(t *testing.T) {
 	if err != nil {
 		t.Fatalf("RebootAllowed: %v", err)
 	}
-	if verdict.Allowed || verdict.Term != TermHold {
-		t.Fatalf("verdict %+v, want blocked when no process could be checked", verdict)
+	if verdict.Allowed || verdict.Term != TermScan {
+		t.Fatalf("verdict %+v, want the scan term when no process could be checked", verdict)
 	}
 	if len(verdict.Unclaimed) != 1 || !strings.Contains(verdict.Unclaimed[0], "cannot read /proc") {
 		t.Errorf("unclaimed %v does not name the failed scan", verdict.Unclaimed)

@@ -56,8 +56,8 @@ All notable changes to this project are recorded here. The format follows
   check blocks instead of reporting an idle train.
 - Hold owners and item ids must be slugs. A name that would need rewriting is
   rejected, so two identities never share one file.
-- An agent scan that cannot read `/proc` blocks a pass and a reboot instead of
-  reporting no agents.
+- An agent scan that cannot read `/proc` blocks a pass and a reboot under the
+  `scan` term instead of reporting no agents or looking like an operator hold.
 - The TUI no longer offers keys it does not implement. `[d]efer` records a
   deferral through the engine, and the detail pane prints the repair command.
 

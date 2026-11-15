@@ -20,8 +20,11 @@ const RebootID = "reboot"
 
 // Reboot terms, in the order the gate evaluates them.
 const (
-	TermWindow  = "window"
-	TermHold    = "hold"
+	TermWindow = "window"
+	TermHold   = "hold"
+	// TermScan means no process could be checked, so an unclaimed agent cannot
+	// be ruled out. It is not a hold the operator wrote.
+	TermScan    = "scan"
 	TermSession = "session"
 	TermOwnJob  = "own-job"
 )
@@ -61,7 +64,7 @@ func (e *Engine) rebootAllowedLocked(ctx context.Context) (RebootVerdict, error)
 	}
 	unclaimed, err := e.unclaimedAgents(holds)
 	if err != nil {
-		return RebootVerdict{Term: TermHold, Unclaimed: []string{"process scan failed: " + err.Error()}}, nil
+		return RebootVerdict{Term: TermScan, Unclaimed: []string{"process scan failed: " + err.Error()}}, nil
 	}
 	if len(holds) > 0 || len(unclaimed) > 0 {
 		var age time.Duration

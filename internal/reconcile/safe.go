@@ -11,6 +11,10 @@ const (
 	termNeedsTTY = "needs-tty"
 	// termHold marks work held back by a live hold.
 	termHold = "hold"
+	// termScan marks work held back because no process could be checked, so an
+	// agent may be running unclaimed. It is distinct from a hold the operator
+	// wrote, because the fix is a different one.
+	termScan = "scan"
 	// termUnverified marks a measurement that proves nothing either way.
 	termUnverified = "unverified"
 	// termDidNotHold marks a repair whose verification saw no movement.

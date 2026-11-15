@@ -435,6 +435,28 @@ func TestPassRequiresTheRecordToBePresent(t *testing.T) {
 	if len(result.Escalated) != 1 {
 		t.Fatalf("escalated %v", result.Escalated)
 	}
+	if term := h.queued(t)["profile"].Term; term != termDidNotHold {
+		t.Errorf("term %q, want %q: an absent verification must not converge", term, termDidNotHold)
+	}
+}
+
+func TestPassNamesAFailedScan(t *testing.T) {
+	h := newHarness(t, profileDrift())
+	h.engine.agents = func() ([]Agent, error) { return nil, errors.New("cannot read /proc") }
+
+	if _, err := h.engine.Pass(context.Background()); err != nil {
+		t.Fatalf("Pass: %v", err)
+	}
+	if len(h.runs) != 0 {
+		t.Errorf("ran %v when no process could be checked", h.runs)
+	}
+	item, ok := h.queued(t)["profile"]
+	if !ok {
+		t.Fatal("the item vanished when the process scan failed")
+	}
+	if item.Term != termScan {
+		t.Errorf("term %q, want %q", item.Term, termScan)
+	}
 }
 
 func TestPassWaitsWhileAHoldIsLive(t *testing.T) {
@@ -556,6 +578,29 @@ func TestDeferWritesAVerdictAndMovesTheItem(t *testing.T) {
 	}
 	if !item.NextAttemptAt.Equal(fixedNow.Add(2 * time.Hour)) {
 		t.Errorf("next attempt %v", item.NextAttemptAt)
+	}
+
+	verdicts, err := h.store.Verdicts()
+	if err != nil {
+		t.Fatal(err)
+	}
+	var record *state.Verdict
+	for i := range verdicts {
+		if verdicts[i].IsDeferral() {
+			record = &verdicts[i]
+		}
+	}
+	if record == nil {
+		t.Fatal("no defer record was appended to the verdict log")
+	}
+	if record.ID != "offsite" || record.Kind != state.KindDefer {
+		t.Errorf("defer record %+v, want id offsite and kind %q", record, state.KindDefer)
+	}
+	if record.Detail != "waiting on the provider" {
+		t.Errorf("defer record detail %q, want the reason", record.Detail)
+	}
+	if !record.Until.Equal(fixedNow.Add(2 * time.Hour)) {
+		t.Errorf("defer record until %v, want %v", record.Until, fixedNow.Add(2*time.Hour))
 	}
 
 	deferred, err := h.store.Deferrals()
