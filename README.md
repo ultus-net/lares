@@ -73,6 +73,11 @@ lares tui                     the punch list
 └── runs/            one log per converge, named by item and timestamp
 ```
 
+## Docs
+
+- [Operations](docs/operations.md): one pass, the safe set, holds, the reboot
+  terms, state durability, and troubleshooting.
+
 ## Licence
 
 MIT. See `LICENSE`.
