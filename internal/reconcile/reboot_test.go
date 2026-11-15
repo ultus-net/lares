@@ -168,6 +168,35 @@ func TestRebootUnknownFamilyIsAnError(t *testing.T) {
 	}
 }
 
+func TestRebootBlockedByUnclaimedAgent(t *testing.T) {
+	h := newHarness(t, []contract.Record{})
+	h.engine.agents = func() []string { return []string{"opencode"} }
+	verdict, err := h.engine.RebootAllowed(context.Background())
+	if err != nil {
+		t.Fatalf("RebootAllowed: %v", err)
+	}
+	if verdict.Allowed || verdict.Term != TermHold {
+		t.Fatalf("verdict %+v, want blocked on an unclaimed agent", verdict)
+	}
+	if len(verdict.Unclaimed) != 1 || verdict.Unclaimed[0] != "opencode" {
+		t.Errorf("unclaimed %v, want [opencode]", verdict.Unclaimed)
+	}
+}
+
+func TestUnclaimedAgents(t *testing.T) {
+	h := newHarness(t, []contract.Record{})
+	h.engine.agents = func() []string { return []string{"opencode", "orca"} }
+
+	if got := h.engine.unclaimedAgents(nil); len(got) != 2 {
+		t.Errorf("unclaimed %v, want both agents", got)
+	}
+	holds := []state.Hold{{Owner: "pid-123", Reason: "opencode session"}}
+	got := h.engine.unclaimedAgents(holds)
+	if len(got) != 1 || got[0] != "orca" {
+		t.Errorf("unclaimed %v, want [orca]", got)
+	}
+}
+
 func TestSessionErrorFailsClosed(t *testing.T) {
 	h := newHarness(t, []contract.Record{})
 	h.engine.session = func(context.Context) (bool, error) {

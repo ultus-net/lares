@@ -59,6 +59,7 @@ type Options struct {
 	Sleep    func(ctx context.Context, d time.Duration) error
 	Session  func(ctx context.Context) (bool, error)
 	Train    func(ctx context.Context) (bool, error)
+	Agents   func() []string
 	Activate func(ctx context.Context, argv []string) error
 }
 
@@ -76,6 +77,7 @@ type Engine struct {
 	sleep    func(ctx context.Context, d time.Duration) error
 	session  func(ctx context.Context) (bool, error)
 	train    func(ctx context.Context) (bool, error)
+	agents   func() []string
 	activate func(ctx context.Context, argv []string) error
 
 	busy atomic.Bool
@@ -111,6 +113,7 @@ func New(opts Options) (*Engine, error) {
 		sleep:    opts.Sleep,
 		session:  opts.Session,
 		train:    opts.Train,
+		agents:   opts.Agents,
 		activate: opts.Activate,
 	}
 	if e.now == nil {
@@ -135,6 +138,9 @@ func New(opts Options) (*Engine, error) {
 	}
 	if e.train == nil {
 		e.train = func(ctx context.Context) (bool, error) { return defaultTrainRunning(ctx, e.family) }
+	}
+	if e.agents == nil {
+		e.agents = defaultAgents
 	}
 	if e.activate == nil {
 		e.activate = func(ctx context.Context, argv []string) error {
@@ -221,7 +227,7 @@ func (e *Engine) Pass(ctx context.Context) (Result, error) {
 		}
 		item.Term = termNeedsOperator
 
-		if !safeToConverge(rec.ID) {
+		if !safeToConverge(rec.ID) || rec.Fix == "" {
 			next.Items = append(next.Items, item)
 			result.Queued = append(result.Queued, rec.ID)
 			continue

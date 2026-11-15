@@ -30,6 +30,8 @@ type RebootVerdict struct {
 	Allowed bool
 	Term    string
 	HoldAge time.Duration
+	// Unclaimed names long-horizon processes that are running without a hold.
+	Unclaimed []string
 }
 
 // RebootAllowed evaluates the four terms without changing anything.
@@ -42,14 +44,15 @@ func (e *Engine) RebootAllowed(ctx context.Context) (RebootVerdict, error) {
 	if err != nil {
 		return RebootVerdict{}, err
 	}
-	if len(holds) > 0 {
-		age := e.now().Sub(holds[0].Start)
-		for _, hold := range holds[1:] {
+	unclaimed := e.unclaimedAgents(holds)
+	if len(holds) > 0 || len(unclaimed) > 0 {
+		var age time.Duration
+		for _, hold := range holds {
 			if holdAge := e.now().Sub(hold.Start); holdAge > age {
 				age = holdAge
 			}
 		}
-		return RebootVerdict{Term: TermHold, HoldAge: age}, nil
+		return RebootVerdict{Term: TermHold, HoldAge: age, Unclaimed: unclaimed}, nil
 	}
 
 	active, err := e.session(ctx)
@@ -148,6 +151,71 @@ func (e *Engine) clearBlockedReboot() error {
 	queue.Items = kept
 	_, err = e.store.SaveQueue(queue)
 	return err
+}
+
+// longHorizon is the set of process names that must hold the host.
+//
+// An agent that forgets to write a hold is the failure this policy exists to
+// remove, so a live process with no hold blocks the reboot and is reported.
+var longHorizon = map[string]bool{
+	"opencode": true,
+	"orca":     true,
+}
+
+// unclaimedAgents names long-horizon processes with no hold that claims them.
+func (e *Engine) unclaimedAgents(holds []state.Hold) []string {
+	var unclaimed []string
+	for _, name := range e.agents() {
+		claimed := false
+		for _, hold := range holds {
+			if strings.Contains(hold.Owner, name) || strings.Contains(hold.Reason, name) {
+				claimed = true
+				break
+			}
+		}
+		if !claimed {
+			unclaimed = append(unclaimed, name)
+		}
+	}
+	return unclaimed
+}
+
+// defaultAgents scans /proc for long-horizon processes.
+func defaultAgents() []string {
+	entries, err := os.ReadDir("/proc")
+	if err != nil {
+		return nil
+	}
+	seen := make(map[string]bool)
+	var found []string
+	for _, entry := range entries {
+		if !entry.IsDir() || !isPID(entry.Name()) {
+			continue
+		}
+		data, err := os.ReadFile(filepath.Join("/proc", entry.Name(), "comm"))
+		if err != nil {
+			continue
+		}
+		name := strings.TrimSpace(string(data))
+		if longHorizon[name] && !seen[name] {
+			seen[name] = true
+			found = append(found, name)
+		}
+	}
+	return found
+}
+
+// isPID reports whether name is all digits.
+func isPID(name string) bool {
+	if name == "" {
+		return false
+	}
+	for _, r := range name {
+		if r < '0' || r > '9' {
+			return false
+		}
+	}
+	return true
 }
 
 // defaultSessionActive reports whether a person is still using the machine.
