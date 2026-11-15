@@ -43,6 +43,13 @@ All notable changes to this project are recorded here. The format follows
 - CLI smoke tests that drive the built binary: the four documented exit codes,
   `hold exec`'s hold and release, the deferral floor, the install file set and
   its single printed step, and the `measure` and `status` JSON shapes.
+- The reboot gate reads `systemd-inhibit --list`. A `block` or `block-weak`
+  lock blocks the reboot as a busy session, because a build or a backup asked
+  the host to stay up. A `delay` lock does not. The parser is tested against
+  output captured from systemd 262 (`inhibit_test.go` records the provenance),
+  and a failed read or an unparsable line blocks instead of reporting idle. A
+  host without the command fails the read, so it blocks rather than reading as
+  idle.
 
 ### Changed
 
