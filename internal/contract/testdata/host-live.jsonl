@@ -1,0 +1,11 @@
+{"id":"backup","state":"live","detail":"mounted at /mnt/storage, timer enabled/active, password present","fix":""}
+{"id":"hermes","state":"live","detail":"unit enabled/active, linger=yes","fix":"install/host-setup.sh --only hermes --apply"}
+{"id":"routing","state":"live","detail":"reviewer=openrouter, executor=synthetic","fix":""}
+{"id":"notebook","state":"live","detail":"tier=personal","fix":"install/host-setup.sh --only notebook --apply"}
+{"id":"patch-train","state":"live","detail":"timer enabled","fix":"install/host-setup.sh --only patch-train --apply"}
+{"id":"maintenance","state":"live","detail":"fstrim=enabled, paccache=enabled, journal<=500M","fix":"install/host-setup.sh --only maintenance --apply"}
+{"id":"offsite","state":"live","detail":"BACKUP_OFFSITE_REPO configured","fix":"install/offsite-oauth-wizard.sh"}
+{"id":"profile","state":"live","detail":"laptop-omarchy","fix":"install/host-setup.sh --only profile --apply"}
+{"id":"supply-chain","state":"live","detail":"every workflow uses: is a full SHA","fix":""}
+{"id":"branch-chore-land-prs","state":"live","detail":"chore/land-prs is merged into main","fix":""}
+{"id":"summary","state":"live","detail":"live=10 not-live=0 stale=0 unknown=0","fix":""}
