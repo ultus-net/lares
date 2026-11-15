@@ -36,7 +36,7 @@ func TestRebootBlockedByWindow(t *testing.T) {
 
 func TestRebootBlockedByHold(t *testing.T) {
 	h := newHarness(t, []contract.Record{})
-	hold := state.Hold{Owner: "opencode", Reason: "agent run", PID: os.Getpid(), Start: fixedNow.Add(-2 * time.Hour)}
+	hold := state.Hold{Owner: "pid-opencode", Reason: "agent run", PID: os.Getpid(), Start: fixedNow.Add(-2 * time.Hour)}
 	if err := h.store.AddHold(hold); err != nil {
 		t.Fatal(err)
 	}
@@ -100,15 +100,33 @@ func TestRebootBlockedByTrain(t *testing.T) {
 	}
 }
 
-func TestRebootBlockedWhileBusy(t *testing.T) {
+func TestRebootFailsClosedWhenTheTrainIsUnknown(t *testing.T) {
 	h := newHarness(t, []contract.Record{})
-	h.engine.busy.Store(true)
+	h.engine.train = func(context.Context) (bool, error) {
+		return false, errors.New("omarchy-update-lock is missing")
+	}
 	verdict, err := h.engine.RebootAllowed(context.Background())
 	if err != nil {
 		t.Fatalf("RebootAllowed: %v", err)
 	}
 	if verdict.Allowed || verdict.Term != TermOwnJob {
-		t.Fatalf("verdict %+v, want blocked while the engine is busy", verdict)
+		t.Fatalf("verdict %+v, want blocked when the train state is unknown", verdict)
+	}
+}
+
+func TestRebootRefusesWhenAnotherProcessHoldsTheLock(t *testing.T) {
+	h := newHarness(t, []contract.Record{})
+	other, err := state.Open(h.stateDir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := other.Lock(); err != nil {
+		t.Fatal(err)
+	}
+	defer other.Unlock()
+
+	if _, err := h.engine.Reboot(context.Background()); !errors.Is(err, state.ErrLocked) {
+		t.Fatalf("Reboot error %v, want ErrLocked", err)
 	}
 }
 
@@ -170,7 +188,7 @@ func TestRebootUnknownFamilyIsAnError(t *testing.T) {
 
 func TestRebootBlockedByUnclaimedAgent(t *testing.T) {
 	h := newHarness(t, []contract.Record{})
-	h.engine.agents = func() []string { return []string{"opencode"} }
+	h.engine.agents = func() ([]Agent, error) { return []Agent{{PID: 4242, Name: "opencode"}}, nil }
 	verdict, err := h.engine.RebootAllowed(context.Background())
 	if err != nil {
 		t.Fatalf("RebootAllowed: %v", err)
@@ -178,22 +196,96 @@ func TestRebootBlockedByUnclaimedAgent(t *testing.T) {
 	if verdict.Allowed || verdict.Term != TermHold {
 		t.Fatalf("verdict %+v, want blocked on an unclaimed agent", verdict)
 	}
-	if len(verdict.Unclaimed) != 1 || verdict.Unclaimed[0] != "opencode" {
-		t.Errorf("unclaimed %v, want [opencode]", verdict.Unclaimed)
+	if len(verdict.Unclaimed) != 1 || verdict.Unclaimed[0] != "opencode[4242]" {
+		t.Errorf("unclaimed %v, want [opencode[4242]]", verdict.Unclaimed)
 	}
 }
 
-func TestUnclaimedAgents(t *testing.T) {
+func TestUnclaimedAgentsMatchByPID(t *testing.T) {
 	h := newHarness(t, []contract.Record{})
-	h.engine.agents = func() []string { return []string{"opencode", "orca"} }
-
-	if got := h.engine.unclaimedAgents(nil); len(got) != 2 {
-		t.Errorf("unclaimed %v, want both agents", got)
+	h.engine.agents = func() ([]Agent, error) {
+		return []Agent{{PID: 111, Name: "opencode"}, {PID: 222, Name: "orca"}}, nil
 	}
-	holds := []state.Hold{{Owner: "pid-123", Reason: "opencode session"}}
-	got := h.engine.unclaimedAgents(holds)
-	if len(got) != 1 || got[0] != "orca" {
-		t.Errorf("unclaimed %v, want [orca]", got)
+
+	if got, err := h.engine.unclaimedAgents(nil); err != nil || len(got) != 2 {
+		t.Errorf("unclaimed %v (%v), want both agents", got, err)
+	}
+
+	// A hold that only mentions the name must not claim the process.
+	holds := []state.Hold{{Owner: "opencode-session", Reason: "opencode run", PID: 999}}
+	got, err := h.engine.unclaimedAgents(holds)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(got) != 2 {
+		t.Errorf("unclaimed %v, want both agents: a name is not a pid", got)
+	}
+
+	// A hold with the pid claims exactly that process.
+	holds = append(holds, state.Hold{Owner: "pid-111", Reason: "agent", PID: 111})
+	got, err = h.engine.unclaimedAgents(holds)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(got) != 1 || got[0] != "orca[222]" {
+		t.Errorf("unclaimed %v, want [orca[222]]", got)
+	}
+}
+
+func TestRebootFailsClosedWhenTheAgentScanFails(t *testing.T) {
+	h := newHarness(t, []contract.Record{})
+	h.engine.agents = func() ([]Agent, error) { return nil, errors.New("cannot read /proc") }
+	verdict, err := h.engine.RebootAllowed(context.Background())
+	if err != nil {
+		t.Fatalf("RebootAllowed: %v", err)
+	}
+	if verdict.Allowed || verdict.Term != TermHold {
+		t.Fatalf("verdict %+v, want blocked when no process could be checked", verdict)
+	}
+	if len(verdict.Unclaimed) != 1 || !strings.Contains(verdict.Unclaimed[0], "cannot read /proc") {
+		t.Errorf("unclaimed %v does not name the failed scan", verdict.Unclaimed)
+	}
+}
+
+func TestHoldClaimsRejectsAReusedPID(t *testing.T) {
+	hold := state.Hold{PID: 10, StartTicks: 100}
+	if holdClaims(hold, Agent{PID: 10, StartTicks: 200}) {
+		t.Error("a hold claimed a process with a different start time")
+	}
+	if !holdClaims(hold, Agent{PID: 10, StartTicks: 100}) {
+		t.Error("a hold failed to claim its own process")
+	}
+	if holdClaims(hold, Agent{PID: 11, StartTicks: 100}) {
+		t.Error("a hold claimed a different pid")
+	}
+}
+
+func TestTrainCheckForFedoraFamilies(t *testing.T) {
+	previous := runningCommands
+	t.Cleanup(func() { runningCommands = previous })
+
+	runningCommands = func() ([]string, error) { return []string{"bash", "rpm-ostree"}, nil }
+	if running, err := defaultTrainRunning(context.Background(), adapter.FedoraAtomic); err != nil || !running {
+		t.Errorf("rpm-ostree running: got (%v, %v), want (true, nil)", running, err)
+	}
+	if running, err := defaultTrainRunning(context.Background(), adapter.Bootc); err != nil || running {
+		t.Errorf("bootc with no bootc process: got (%v, %v), want (false, nil)", running, err)
+	}
+
+	runningCommands = func() ([]string, error) { return []string{"bootc"}, nil }
+	if running, err := defaultTrainRunning(context.Background(), adapter.Bootc); err != nil || !running {
+		t.Errorf("bootc running: got (%v, %v), want (true, nil)", running, err)
+	}
+
+	runningCommands = func() ([]string, error) { return nil, errors.New("no /proc") }
+	if _, err := defaultTrainRunning(context.Background(), adapter.FedoraAtomic); err == nil {
+		t.Error("an unreadable /proc was treated as an idle train")
+	}
+}
+
+func TestTrainCheckOfAnUnknownFamilyFailsClosed(t *testing.T) {
+	if running, err := defaultTrainRunning(context.Background(), adapter.Unknown); err == nil {
+		t.Errorf("unknown family: got (%v, nil), want an error", running)
 	}
 }
 

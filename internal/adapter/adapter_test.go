@@ -13,26 +13,29 @@ func TestDetect(t *testing.T) {
 		name    string
 		release string
 		ostree  bool
+		bootc   bool
 		want    Family
 	}{
-		{"arch plain", "ID=arch\n", false, Arch},
-		{"arch quoted", `ID="arch"` + "\n", false, Arch},
-		{"arch single quoted", "ID='arch'\n", false, Arch},
-		{"arch via id_like", `ID="manjaro"` + "\n" + `ID_LIKE="arch"` + "\n", false, Arch},
-		{"arch via id_like middle", `ID="endeavouros"` + "\n" + `ID_LIKE="arch linux"` + "\n", false, Arch},
-		{"fedora atomic", `ID="fedora"` + "\n", true, FedoraAtomic},
-		{"fedora via id_like", `ID="bazzite"` + "\n" + `ID_LIKE="fedora"` + "\n", true, FedoraAtomic},
-		{"fedora without rpm-ostree is not atomic", `ID="fedora"` + "\n", false, Unknown},
-		{"fedora id_like without rpm-ostree", `ID="bazzite"` + "\n" + `ID_LIKE="fedora"` + "\n", false, Unknown},
-		{"debian", `ID=debian` + "\n", false, Unknown},
-		{"empty", "", false, Unknown},
-		{"garbage", "this is not os-release\n\x00\x01", false, Unknown},
-		{"comments and blanks", "# a comment\n\nID=arch\n", false, Arch},
-		{"arch substring is not arch", `ID="archlinux-extra"` + "\n", false, Unknown},
+		{"arch plain", "ID=arch\n", false, false, Arch},
+		{"arch quoted", `ID="arch"` + "\n", false, false, Arch},
+		{"arch single quoted", "ID='arch'\n", false, false, Arch},
+		{"arch via id_like", `ID="manjaro"` + "\n" + `ID_LIKE="arch"` + "\n", false, false, Arch},
+		{"arch via id_like middle", `ID="endeavouros"` + "\n" + `ID_LIKE="arch linux"` + "\n", false, false, Arch},
+		{"fedora atomic", `ID="fedora"` + "\n", true, false, FedoraAtomic},
+		{"fedora via id_like", `ID="bazzite"` + "\n" + `ID_LIKE="fedora"` + "\n", true, false, FedoraAtomic},
+		{"fedora bootc", `ID="fedora"` + "\n", false, true, Bootc},
+		{"bootc wins over rpm-ostree", `ID="fedora"` + "\n", true, true, Bootc},
+		{"fedora without either layer is not atomic", `ID="fedora"` + "\n", false, false, Unknown},
+		{"fedora id_like without a layer", `ID="bazzite"` + "\n" + `ID_LIKE="fedora"` + "\n", false, false, Unknown},
+		{"debian", `ID=debian` + "\n", false, false, Unknown},
+		{"empty", "", false, false, Unknown},
+		{"garbage", "this is not os-release\n\x00\x01", false, false, Unknown},
+		{"comments and blanks", "# a comment\n\nID=arch\n", false, false, Arch},
+		{"arch substring is not arch", `ID="archlinux-extra"` + "\n", false, false, Unknown},
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			got, err := Detect([]byte(tt.release), tt.ostree)
+			got, err := Detect([]byte(tt.release), tt.ostree, tt.bootc)
 			if err != nil {
 				t.Fatalf("Detect: %v", err)
 			}
@@ -40,6 +43,29 @@ func TestDetect(t *testing.T) {
 				t.Errorf("Detect = %q, want %q", got, tt.want)
 			}
 		})
+	}
+}
+
+func TestDefaultsCoverEveryFamily(t *testing.T) {
+	table := Defaults()
+	for _, family := range []Family{Arch, FedoraAtomic, Bootc} {
+		entry, ok := table[family]
+		if !ok {
+			t.Errorf("no default adapter for %q", family)
+			continue
+		}
+		if len(entry.Stage) == 0 || entry.Stage[0] == "" {
+			t.Errorf("%q default stage is empty", family)
+		}
+		if len(entry.Activate) == 0 || entry.Activate[0] == "" {
+			t.Errorf("%q default activate is empty", family)
+		}
+	}
+	if got := strings.Join(table[Arch].Stage, " "); got != "patch-train-update" {
+		t.Errorf("arch stage %q", got)
+	}
+	if got := strings.Join(table[Arch].Activate, " "); got != "omarchy-system reboot" {
+		t.Errorf("arch activate %q", got)
 	}
 }
 

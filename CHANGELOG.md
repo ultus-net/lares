@@ -28,3 +28,41 @@ All notable changes to this project are recorded here. The format follows
   the holds, and a raw-detail pane.
 - Verdict history pruned once per pass, with the rewrite skipped when nothing
   expires.
+- An interprocess `flock` on `<state>/lock`. A pass, a reboot, a measure, and a
+  hold or deferral write serialize on it, and a second process gets `ErrLocked`
+  instead of waiting.
+- `lares hold add --pid N` holds another process, `lares hold exec -- cmd` holds
+  for the life of a command, and holds carry the process start time so a reused
+  pid cannot keep a stale hold alive.
+- `repo_dir` and `reboot_from_pass` in `config.toml`. A pass evaluates the
+  reboot gate last, under the lock it already holds.
+- A `bootc` adapter family, detected ahead of `rpm-ostree`.
+- Deferrals are appended to the verdict log as `defer` records and replayed, so
+  a rebuilt queue keeps the operator's judgement.
+- `unknown` records are queued and shown, never treated as healthy.
+
+### Changed
+
+- The safe set narrows to `profile`. Every other repair queues with the
+  precondition that blocked it: `needs-tty`, `needs-grant`, or
+  `needs-operator`. `maintenance`, `hermes`, and `notebook` cannot run
+  unattended: the first two open `/dev/tty` for sudo, and the third creates and
+  pushes a GitHub repository.
+- Convergence requires a verification measurement that names the item and says
+  `live`. A missing record and an `unknown` record both leave the item queued.
+- The reboot gate fails closed when the session state or the update train state
+  cannot be read, and names a long-horizon process with no hold as `unclaimed`.
+  Fedora families find the transaction by process name; a family with no train
+  check blocks instead of reporting an idle train.
+- Hold owners and item ids must be slugs. A name that would need rewriting is
+  rejected, so two identities never share one file.
+- An agent scan that cannot read `/proc` blocks a pass and a reboot instead of
+  reporting no agents.
+- The TUI no longer offers keys it does not implement. `[d]efer` records a
+  deferral through the engine, and the detail pane prints the repair command.
+
+### Removed
+
+- Sudoers generation. The installer never asks for a standing grant, so a
+  repair that needs root stays queued.
+- `[s]etup` and `[c]lean` in the punch list, which had no handler.

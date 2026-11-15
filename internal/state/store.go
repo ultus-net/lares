@@ -76,6 +76,21 @@ func (s *Store) Verdicts() ([]Verdict, error) {
 	return verdicts, nil
 }
 
+// Deferrals returns the newest deferral per item, in log order.
+func (s *Store) Deferrals() (map[string]Verdict, error) {
+	verdicts, err := s.Verdicts()
+	if err != nil {
+		return nil, err
+	}
+	deferred := make(map[string]Verdict)
+	for _, v := range verdicts {
+		if v.IsDeferral() {
+			deferred[v.ID] = v
+		}
+	}
+	return deferred, nil
+}
+
 // Queue returns the queue and whether it came from the backup after the
 // primary was found unparsable. ErrNoQueue means neither file exists.
 func (s *Store) Queue() (Queue, bool, error) {
@@ -237,7 +252,7 @@ func (s *Store) holds(includeStale bool) ([]Hold, error) {
 			}
 			continue
 		}
-		if hold.PID <= 0 || !processAlive(hold.PID) {
+		if !holdLive(hold) {
 			if includeStale {
 				hold.Stale = true
 				holds = append(holds, hold)
@@ -268,13 +283,14 @@ func readHold(path string) (Hold, error) {
 
 // AddHold writes h, replacing any hold with the same owner.
 //
-// The owner is sanitised to a filename stem, and the stored Owner is that stem,
-// so listing holds reports the identity that was written.
+// The owner must already be a slug, and the stored Owner is that slug, so
+// listing holds reports the identity that was written and no two owners share a
+// file.
 func (s *Store) AddHold(h Hold) error {
-	owner, err := holdStem(h.Owner)
-	if err != nil {
-		return err
+	if !ValidSlug(h.Owner) {
+		return fmt.Errorf("invalid hold owner %q", h.Owner)
 	}
+	owner := h.Owner
 	h.Owner = owner
 
 	data, err := json.Marshal(h)
@@ -287,33 +303,22 @@ func (s *Store) AddHold(h Hold) error {
 
 // RemoveHold deletes owner's hold. Removing an absent hold is not an error.
 func (s *Store) RemoveHold(owner string) error {
-	stem, err := holdStem(owner)
-	if err != nil {
-		return err
+	if !ValidSlug(owner) {
+		return fmt.Errorf("invalid hold owner %q", owner)
 	}
-	if err := os.Remove(filepath.Join(s.holdsDir, stem+".json")); err != nil && !errors.Is(err, fs.ErrNotExist) {
-		return fmt.Errorf("remove hold %s: %w", stem, err)
+	if err := os.Remove(filepath.Join(s.holdsDir, owner+".json")); err != nil && !errors.Is(err, fs.ErrNotExist) {
+		return fmt.Errorf("remove hold %s: %w", owner, err)
 	}
 	return nil
-}
-
-// holdStem sanitises an owner and rejects the names that cannot be files.
-func holdStem(owner string) (string, error) {
-	stem := sanitizeOwner(owner)
-	if stem == "" || stem == "." || stem == ".." {
-		return "", fmt.Errorf("invalid hold owner %q", owner)
-	}
-	return stem, nil
 }
 
 // RunLog appends body to the item's log for at's UTC day and returns the path.
 // It refuses a write that would take the file past runLogCap.
 func (s *Store) RunLog(item string, at time.Time, body []byte) (string, error) {
-	stem := sanitizeOwner(item)
-	if stem == "" || stem == "." || stem == ".." {
+	if !ValidSlug(item) {
 		return "", fmt.Errorf("invalid run log item %q", item)
 	}
-	path := filepath.Join(s.runsDir, fmt.Sprintf("%s-%s.log", stem, at.UTC().Format("20060102")))
+	path := filepath.Join(s.runsDir, fmt.Sprintf("%s-%s.log", item, at.UTC().Format("20060102")))
 
 	f, err := os.OpenFile(path, os.O_WRONLY|os.O_CREATE|os.O_APPEND, 0o600)
 	if err != nil {

@@ -7,7 +7,6 @@ package tui
 
 import (
 	"context"
-	"errors"
 	"fmt"
 	"os"
 	"sort"
@@ -34,6 +33,7 @@ type row struct {
 	ID     string
 	State  contract.State
 	Detail string
+	Fix    string
 	Age    time.Duration
 	Action string
 }
@@ -120,8 +120,10 @@ func rowsFrom(status reconcile.Status, now time.Time) []row {
 		verdict, ok := status.Verdicts[item.ID]
 		st := contract.Unknown
 		detail := item.Term
+		fix := ""
 		if ok {
 			st = contract.State(verdict.State)
+			fix = verdict.Fix
 			if verdict.Detail != "" {
 				detail = verdict.Detail
 			}
@@ -133,8 +135,9 @@ func rowsFrom(status reconcile.Status, now time.Time) []row {
 			ID:     item.ID,
 			State:  st,
 			Detail: detail,
+			Fix:    fix,
 			Age:    now.Sub(item.FirstSeen),
-			Action: actionFor(item.ID, st),
+			Action: actionFor(item.ID),
 		})
 	}
 
@@ -150,8 +153,9 @@ func rowsFrom(status reconcile.Status, now time.Time) []row {
 			ID:     verdict.ID,
 			State:  st,
 			Detail: verdict.Detail,
+			Fix:    verdict.Fix,
 			Age:    now.Sub(verdict.At),
-			Action: actionFor(verdict.ID, st),
+			Action: actionFor(verdict.ID),
 		})
 	}
 
@@ -164,9 +168,11 @@ func rowsFrom(status reconcile.Status, now time.Time) []row {
 	return rows
 }
 
-// isFinding reports whether a state needs attention.
+// isFinding reports whether a state needs attention. An unknown measurement is
+// shown too: nothing proved the item healthy, so hiding it would lose the
+// finding.
 func isFinding(st contract.State) bool {
-	return st == contract.NotLive || st == contract.Stale
+	return st == contract.NotLive || st == contract.Stale || st == contract.Unknown
 }
 
 // severity ranks states, worst first.
@@ -184,21 +190,14 @@ func severity(st contract.State) int {
 }
 
 // actionFor names the key that acts on an item.
-func actionFor(id string, st contract.State) string {
-	switch {
-	case id == reconcile.RebootID:
+//
+// Only the keys the model implements appear. A repair that needs a person is
+// shown with its command in the detail pane, never with a key that does nothing.
+func actionFor(id string) string {
+	if id == reconcile.RebootID {
 		return "[r]eboot"
-	case id == "offsite":
-		return "[s]etup"
-	case strings.HasPrefix(id, "branch-"):
-		return "[c]lean"
-	case id == "patch-train":
-		return "[v]iew"
-	case id == "backup":
-		return "[v]iew"
-	default:
-		return "[d]efer"
 	}
+	return "[d]efer"
 }
 
 // formatAge renders a duration as minutes, hours, days, or weeks.
@@ -292,43 +291,17 @@ func (m Model) handleKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 	return m, nil
 }
 
-// deferSelected moves the selected item's next attempt an hour out.
+// deferSelected records a one-hour deferral through the engine, so the
+// operator's judgement lands in the verdict log and survives a lost queue.
 func (m *Model) deferSelected() error {
 	if len(m.rows) == 0 {
 		return nil
 	}
 	id := m.rows[m.selected].ID
-	queue, _, err := m.store.Queue()
-	if err != nil && !isNoQueue(err) {
-		return err
-	}
-	now := m.now()
-	found := false
-	for i, item := range queue.Items {
-		if item.ID != id {
-			continue
-		}
-		queue.Items[i].NextAttemptAt = now.Add(time.Hour)
-		queue.Items[i].Term = "deferred"
-		found = true
-	}
-	if !found {
-		queue.Items = append(queue.Items, state.Item{
-			ID:            id,
-			Term:          "deferred",
-			FirstSeen:     now,
-			NextAttemptAt: now.Add(time.Hour),
-		})
-	}
-	if _, err := m.store.SaveQueue(queue); err != nil {
+	if _, err := m.engine.Defer(id, time.Hour, "deferred from the punch list"); err != nil {
 		return err
 	}
 	return m.reload()
-}
-
-// isNoQueue reports whether err means the queue does not exist yet.
-func isNoQueue(err error) bool {
-	return errors.Is(err, state.ErrNoQueue)
 }
 
 // runPass runs one reconcile pass off the UI goroutine.
@@ -391,6 +364,9 @@ func (m Model) View() string {
 		fmt.Fprintf(&b, "\n%s\n", headerStyle.Render("detail: "+r.ID))
 		fmt.Fprintf(&b, "state:  %s\n", r.State)
 		fmt.Fprintf(&b, "detail: %s\n", r.Detail)
+		if r.Fix != "" {
+			fmt.Fprintf(&b, "run:    %s\n", r.Fix)
+		}
 	}
 
 	if m.status != "" {

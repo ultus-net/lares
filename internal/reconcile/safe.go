@@ -1,20 +1,44 @@
 package reconcile
 
-// safeIDs is the v1 safe-converge set.
+// Term names a queue item's reason. A term is data, never prose, so the TUI and
+// the CLI can group by it.
+const (
+	// termNeedsOperator marks work only a person may start.
+	termNeedsOperator = "needs-operator"
+	// termNeedsGrant marks work that needs a privilege the host has not granted.
+	termNeedsGrant = "needs-grant"
+	// termNeedsTTY marks work that opens /dev/tty for sudo.
+	termNeedsTTY = "needs-tty"
+	// termHold marks work held back by a live hold.
+	termHold = "hold"
+	// termUnverified marks a measurement that proves nothing either way.
+	termUnverified = "unverified"
+	// termDidNotHold marks a repair whose verification saw no movement.
+	termDidNotHold = "fix-did-not-hold"
+	// termBackoff marks a due item that is waiting out its retry delay.
+	termBackoff = "backoff"
+	// termDeferred marks an operator's deferral.
+	termDeferred = "deferred"
+)
+
+// safeToConverge reports whether id may run without a person.
 //
-// These four workstreams converge through one idempotent command each, and none
-// can prompt. `patch-train` is excluded on purpose: its timer needs a widened
-// sudo grant first, so enabling it would buy a unit that fails every night.
-// `offsite` needs a provider decision, `backup` needs a mount and a password,
-// and branch cleanup needs a per-branch judgement. Those queue.
-var safeIDs = map[string]bool{
-	"hermes":      true,
-	"maintenance": true,
-	"notebook":    true,
-	"profile":     true,
+// Only the profile selection qualifies. It rewrites one file in the home
+// directory and cannot prompt. Every other repair in host-setup.sh either opens
+// /dev/tty for sudo or writes to a remote, so it goes to the queue instead of
+// running unattended.
+func safeToConverge(id string) bool {
+	return id == "profile"
 }
 
-// safeToConverge reports whether id is in the v1 safe set.
-func safeToConverge(id string) bool {
-	return safeIDs[id]
+// repairTerm names the precondition that keeps id out of the safe set.
+func repairTerm(id string) string {
+	switch id {
+	case "maintenance", "hermes":
+		return termNeedsTTY
+	case "patch-train":
+		return termNeedsGrant
+	default:
+		return termNeedsOperator
+	}
 }

@@ -16,20 +16,21 @@ the decision path.
 
 - Measures through commands it does not own. A probe lives in the dotfiles
   repository, and `lares` reads the verdict it prints.
-- Converges only the repairs that are idempotent and cannot prompt: timers,
-  journal bounds, a profile selection, and a vault push. A repair counts as
-  converged only when a second measurement says the state moved.
-- Queues everything else with the reason it queued, how many times it has been
-  attempted, and when it may be tried again.
+- Converges only the repairs that are idempotent and cannot prompt. Today that
+  set is one item: the profile selection. A repair counts as converged only when
+  a verification measurement names the item and says `live`.
+- Queues everything else with the precondition that blocked it, how many times
+  it has been attempted, and when it may be tried again.
 - Records holds. An agent run, a build, an import, or a call writes a hold, and
-  a reboot or a disruptive converge never runs while one is live.
+  a reboot or a converge never runs while one is live. `lares hold exec -- cmd`
+  holds for exactly the life of a command.
 
 ## What it refuses to do
 
 - It writes no probe and no repair of its own. When the dotfiles repository
   gains a check, `lares` learns it from the contract, not from a code change.
-- It never grants itself privilege. The installer prints the sudoers drop-in and
-  stops; the operator installs it.
+- It never grants itself privilege and never writes sudoers. A repair that needs
+  root stays queued as `needs-grant`.
 - It never reboots while a hold exists, outside the reboot window, with an
   interactive session logged in, or while an update train is running.
 - It never pushes, force-pushes, or rewrites git history, and it deletes no
@@ -47,10 +48,10 @@ make build
 
 `lares install --user` writes the binary to `~/.local/bin/lares`, the units to
 `~/.config/systemd/user/lares.{service,timer}`, and the config to
-`~/.config/lares/{config.toml,adapters.toml,lares.sudoers}`. It prints the two
-commands it will not run for you: the sudoers drop-in and `loginctl
-enable-linger`. A re-install replaces the binary and the units and leaves an
-edited config alone.
+`~/.config/lares/{config.toml,adapters.toml}`. It records the checkout as
+`repo_dir` so the timer finds the probe, and prints the one command it will not
+run for you: `loginctl enable-linger`. A re-install replaces the binary and the
+units and leaves an edited config alone.
 
 ## Commands
 
@@ -58,7 +59,8 @@ edited config alone.
 lares measure [--json]        measure once and print the verdicts
 lares pass                    one reconcile pass: measure, converge, queue
 lares status [--json]         the queue, the holds, and the newest verdict
-lares hold add <reason>       write a hold for this process
+lares hold add [--pid N] <reason>  write a hold for pid N, or for this process
+lares hold exec -- <command>  hold while a command runs, then release it
 lares hold list               list holds, marking stale ones
 lares hold rm <owner>         remove a hold
 lares defer <id> <duration>   keep an item out of the queue for a while
@@ -71,10 +73,11 @@ lares tui                     the punch list
 
 ```text
 ~/.local/state/lares/
-├── verdicts.jsonl   append-only, one record per measure
+├── verdicts.jsonl   append-only, one record per measure or deferral
 ├── queue.json       items awaiting judgement
 ├── holds/           one file per live hold
-└── runs/            one log per converge, named by item and timestamp
+├── runs/            one log per converge, named by item and timestamp
+└── lock             the interprocess lock a pass and a reboot share
 ```
 
 ## Docs
