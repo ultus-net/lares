@@ -27,12 +27,14 @@ import (
 )
 
 // Options are the host reads a check may make. New fills every zero value with
-// the real host, so a test injects only what it exercises.
+// the real host, so a test injects only what it exercises. Host names the
+// machine in the backup branch; it defaults to os.Hostname.
 type Options struct {
 	Config  config.Config
 	Family  adapter.Family
 	Adapter adapter.Adapter
 	Home    string
+	Host    string
 
 	Now         func() time.Time
 	Run         func(ctx context.Context, dir string, argv []string) ([]byte, error)
@@ -58,6 +60,7 @@ type Engine struct {
 	family  adapter.Family
 	adapter adapter.Adapter
 	home    string
+	host    string
 	now     func() time.Time
 	run     func(ctx context.Context, dir string, argv []string) ([]byte, error)
 	statfs  func(path string) (fsStat, error)
@@ -83,11 +86,21 @@ func New(opts Options) (*Engine, error) {
 			return nil, fmt.Errorf("measure: locate home: %w", err)
 		}
 	}
+	host := opts.Host
+	if host == "" {
+		if h, err := os.Hostname(); err == nil {
+			host = h
+		}
+	}
+	if host == "" {
+		host = "unknown"
+	}
 	e := &Engine{
 		cfg:     cfg,
 		family:  opts.Family,
 		adapter: opts.Adapter,
 		home:    home,
+		host:    host,
 		now:     opts.Now,
 		run:     opts.Run,
 		statfs:  opts.Statfs,
@@ -217,20 +230,24 @@ func runCommand(ctx context.Context, dir string, argv []string) ([]byte, error) 
 	return out, nil
 }
 
-// repoID turns a repository path into a slug, with a suffix when two checkout
-// names collide.
+// repoSlug turns a repository path into a unique slug, with a suffix when two
+// checkout names collide.
+func repoSlug(path string, used map[string]bool) string {
+	base := slugify(filepath.Base(path))
+	if base == "" {
+		base = "repo"
+	}
+	slug := base
+	for i := 2; used[slug]; i++ {
+		slug = fmt.Sprintf("%s-%d", base, i)
+	}
+	used[slug] = true
+	return slug
+}
+
+// repoID turns a repository path into a unique item id.
 func repoID(path string, used map[string]bool) string {
-	base := filepath.Base(path)
-	slug := slugify(base)
-	if slug == "" {
-		slug = "repo"
-	}
-	id := "repo-" + slug
-	for i := 2; used[id]; i++ {
-		id = fmt.Sprintf("repo-%s-%d", slug, i)
-	}
-	used[id] = true
-	return id
+	return "repo-" + repoSlug(path, used)
 }
 
 // slugify lowercases and replaces every run of non-alphanumerics with one dash.

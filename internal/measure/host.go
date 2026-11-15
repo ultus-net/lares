@@ -442,14 +442,28 @@ func runOutput(ctx context.Context, dir string, argv []string) ([]byte, error) {
 		}
 		var exit *exec.ExitError
 		if errors.As(err, &exit) {
-			if msg := lastLine(stderr.String()); msg != "" {
-				return nil, fmt.Errorf("exit %d: %s", exit.ExitCode(), msg)
-			}
-			return nil, fmt.Errorf("exit %d", exit.ExitCode())
+			return nil, &exitError{Code: exit.ExitCode(), Msg: lastLine(stderr.String()), Stderr: strings.TrimSpace(stderr.String())}
 		}
 		return nil, err
 	}
 	return stdout.Bytes(), nil
+}
+
+// exitError carries a command's exit status. A caller that must tell "no
+// match" from an unreachable remote reads Code, and a caller that classifies a
+// failure reads the full Stderr.
+type exitError struct {
+	Code   int
+	Msg    string
+	Stderr string
+}
+
+// Error renders the exit status and the last stderr line.
+func (e *exitError) Error() string {
+	if e.Msg != "" {
+		return fmt.Sprintf("exit %d: %s", e.Code, e.Msg)
+	}
+	return fmt.Sprintf("exit %d", e.Code)
 }
 
 // lastLine returns the last non-empty line of s.

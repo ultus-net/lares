@@ -42,9 +42,11 @@ func (e *Engine) repoChecks() []check {
 		}}
 	}
 	used := make(map[string]bool, len(dirs))
-	checks := make([]check, 0, len(dirs))
+	checks := make([]check, 0, len(dirs)*2)
 	for _, dir := range dirs {
-		checks = append(checks, e.repoCheck(repoID(dir, used), dir))
+		slug := repoSlug(dir, used)
+		checks = append(checks, e.repoCheck("repo-"+slug, dir))
+		checks = append(checks, e.backupCheck("backup-"+slug, slug, dir))
 	}
 	return checks
 }
