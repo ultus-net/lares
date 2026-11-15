@@ -19,7 +19,7 @@ All notable changes to this project are recorded here. The format follows
 - The reboot policy: window, holds, interactive sessions, and a running update
   train.
 - `lares install --user`, which writes the binary, the units, and the config,
-  and prints the two privileged commands instead of running them.
+  and prints the one session command it will not run.
 - The CLI: `measure`, `pass`, `status`, `hold add|list|rm`, `defer`, `reboot`,
   `install`, and `tui`, with JSON output on `measure` and `status`.
 - A live `opencode` or `orca` process with no hold blocks a reboot and is named
@@ -40,6 +40,9 @@ All notable changes to this project are recorded here. The format follows
 - Deferrals are appended to the verdict log as `defer` records and replayed, so
   a rebuilt queue keeps the operator's judgement.
 - `unknown` records are queued and shown, never treated as healthy.
+- CLI smoke tests that drive the built binary: the four documented exit codes,
+  `hold exec`'s hold and release, the deferral floor, the install file set and
+  its single printed step, and the `measure` and `status` JSON shapes.
 
 ### Changed
 
