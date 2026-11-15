@@ -63,6 +63,9 @@ type Item struct {
 	Attempts      int       `json:"attempts"`
 	NextAttemptAt time.Time `json:"next_attempt_at"`
 	LastRunLog    string    `json:"last_run_log,omitempty"`
+	// Blocked names a terminal failure kind. A blocked item is queued without
+	// a retry until it leaves the queue or an operator deferral clears it.
+	Blocked string `json:"blocked,omitempty"`
 }
 
 // Queue is the whole queue file.

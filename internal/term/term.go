@@ -27,4 +27,8 @@ const (
 	Backoff = "backoff"
 	// Deferred marks an operator's deferral.
 	Deferred = "deferred"
+	// Escalated marks an unpushed backup that survived the retry threshold. It
+	// outranks the rest of the queue because a single-disk host has no other
+	// copy of the checkout.
+	Escalated = "escalated"
 )

@@ -278,6 +278,15 @@ func (e *Engine) Pass(ctx context.Context) (Result, error) {
 			result.Skipped = append(result.Skipped, rec.ID)
 			continue
 		}
+		if item.Blocked != "" {
+			// A terminal push failure is not retried blind. The item leaves the
+			// queue when a measurement proves it live, or the operator clears
+			// the block with a deferral.
+			item.Term = term.NeedsOperator
+			next.Items = append(next.Items, item)
+			result.Queued = append(result.Queued, rec.ID)
+			continue
+		}
 		if rec.State == contract.Unknown {
 			item.Term = term.Unverified
 			next.Items = append(next.Items, item)
@@ -286,6 +295,12 @@ func (e *Engine) Pass(ctx context.Context) (Result, error) {
 		}
 		if !e.repairer.Safe(rec) {
 			item.Term = e.repairer.Term(rec)
+			if isBackupItem(rec.ID) {
+				item.Attempts++
+				if item.Attempts >= EscalateAfterAttempts {
+					item.Term = term.Escalated
+				}
+			}
 			next.Items = append(next.Items, item)
 			result.Queued = append(result.Queued, rec.ID)
 			continue
@@ -298,23 +313,39 @@ func (e *Engine) Pass(ctx context.Context) (Result, error) {
 		}
 		if item.NextAttemptAt.After(now) {
 			item.Term = term.Backoff
+			if isBackupItem(rec.ID) && item.Attempts >= EscalateAfterAttempts {
+				item.Term = term.Escalated
+			}
 			next.Items = append(next.Items, item)
 			result.Skipped = append(result.Skipped, rec.ID)
 			continue
 		}
 
-		converged, logPath, err := e.converge(ctx, rec)
+		outcome, err := e.converge(ctx, rec)
 		if err != nil {
 			return result, err
 		}
-		if converged {
+		if outcome.converged {
 			result.Converged = append(result.Converged, rec.ID)
 			continue
 		}
 		item.Term = term.DidNotHold
 		item.Attempts++
 		item.NextAttemptAt = now.Add(backoff(e.cfg.Resync, item.Attempts))
-		item.LastRunLog = logPath
+		item.LastRunLog = outcome.logPath
+		if kind, terminal := terminalKind(outcome.repairErr); terminal {
+			// A protected branch, a diverged remote, or a rejected credential
+			// cannot be fixed by retrying. Block the item for a person; a
+			// deferral clears it once the cause is fixed.
+			item.Blocked = kind
+			item.Term = term.NeedsOperator
+			item.NextAttemptAt = time.Time{}
+		}
+		if isBackupItem(rec.ID) && item.Attempts >= EscalateAfterAttempts {
+			// On a single-disk host the checkout is the only copy, so an
+			// unpushed backlog outranks the rest of the punch list.
+			item.Term = term.Escalated
+		}
 		next.Items = append(next.Items, item)
 		result.Escalated = append(result.Escalated, rec.ID)
 		// Keep the attempt even if the pass hits its deadline later.
@@ -336,38 +367,46 @@ func (e *Engine) Pass(ctx context.Context) (Result, error) {
 	return result, nil
 }
 
+// convergeResult is one repair attempt and its verification.
+type convergeResult struct {
+	converged bool
+	logPath   string
+	repairErr error
+}
+
 // converge runs the record's repair, then re-measures on the verify ladder.
 //
-// It returns true only when a verification measurement names the item and says
-// live. A missing record and an unknown record both leave the repair unproven,
-// so the item stays queued.
-func (e *Engine) converge(ctx context.Context, rec contract.Record) (bool, string, error) {
+// It reports converged only when a verification measurement names the item and
+// says live. A missing record and an unknown record both leave the repair
+// unproven, so the item stays queued. A repair error is returned separately so
+// the caller can tell a transient network fault from a terminal one.
+func (e *Engine) converge(ctx context.Context, rec contract.Record) (convergeResult, error) {
 	output, runErr := e.repairer.Repair(ctx, rec)
 
 	logPath, logErr := e.store.RunLog(rec.ID, e.now(), []byte(formatRun(rec, output, runErr)))
 	if logErr != nil {
-		return false, "", logErr
+		return convergeResult{}, logErr
 	}
 	if runErr != nil {
-		return false, logPath, nil
+		return convergeResult{logPath: logPath, repairErr: runErr}, nil
 	}
 
 	for _, delay := range VerifyDelays {
 		if err := e.sleep(ctx, delay); err != nil {
-			return false, logPath, err
+			return convergeResult{logPath: logPath}, err
 		}
 		records, err := e.measure(ctx)
 		if err != nil {
-			return false, logPath, fmt.Errorf("verify %s: %w", rec.ID, err)
+			return convergeResult{logPath: logPath}, fmt.Errorf("verify %s: %w", rec.ID, err)
 		}
 		if err := e.record(records, e.now()); err != nil {
-			return false, logPath, err
+			return convergeResult{logPath: logPath}, err
 		}
 		if st, ok := stateOf(records, rec.ID); ok && st == contract.Live {
-			return true, logPath, nil
+			return convergeResult{converged: true, logPath: logPath}, nil
 		}
 	}
-	return false, logPath, nil
+	return convergeResult{logPath: logPath}, nil
 }
 
 // record appends one verdict per non-summary record.
@@ -436,6 +475,25 @@ func (e *Engine) persistItem(item state.Item) error {
 	return err
 }
 
+// EscalateAfterAttempts is the number of consecutive passes after which an
+// unpushed backup outranks the rest of the punch list.
+const EscalateAfterAttempts = 3
+
+// isBackupItem reports whether id names an outbound backup check.
+func isBackupItem(id string) bool {
+	return strings.HasPrefix(id, "backup-")
+}
+
+// terminalKind returns the classified kind when a repair failure cannot be
+// fixed by retrying. A network fault is the only retryable kind.
+func terminalKind(err error) (string, bool) {
+	var pe *measure.PushError
+	if errors.As(err, &pe) && !pe.Retryable() {
+		return pe.Kind, true
+	}
+	return "", false
+}
+
 // backoff doubles the resync interval per attempt and caps at one day.
 func backoff(resync time.Duration, attempts int) time.Duration {
 	delay := resync
@@ -486,6 +544,9 @@ func (e *Engine) Defer(id string, d time.Duration, reason string) (time.Time, er
 		}
 		queue.Items[i].Term = term.Deferred
 		queue.Items[i].NextAttemptAt = until
+		// A deferral is the operator's action on a terminal push failure, so it
+		// clears the block and lets the next attempt try again.
+		queue.Items[i].Blocked = ""
 		found = true
 		break
 	}

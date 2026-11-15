@@ -13,6 +13,7 @@ import (
 	"github.com/ultus-net/lares/internal/adapter"
 	"github.com/ultus-net/lares/internal/config"
 	"github.com/ultus-net/lares/internal/contract"
+	"github.com/ultus-net/lares/internal/measure"
 	"github.com/ultus-net/lares/internal/state"
 	"github.com/ultus-net/lares/internal/term"
 )
@@ -263,6 +264,122 @@ func TestPassConvergesSafeItem(t *testing.T) {
 	}
 	if last := verdicts[len(verdicts)-1]; last.State != "live" {
 		t.Errorf("newest verdict is %q, want live", last.State)
+	}
+}
+
+// backupStale is one safe backup finding: the local checkout is ahead, so a
+// push is the repair.
+func backupStale() []contract.Record {
+	return []contract.Record{
+		rec("backup-demo", contract.Stale, "push"),
+		summary(contract.Stale),
+	}
+}
+
+// backupDrift is one unsafe backup finding: the remote diverged, so no repair
+// is attempted.
+func backupDrift() []contract.Record {
+	return []contract.Record{
+		rec("backup-demo", contract.NotLive, "push"),
+		summary(contract.NotLive),
+	}
+}
+
+// pushRepairer fails every repair with a classified push error and counts the
+// calls, so a test can prove a terminal failure is not retried.
+type pushRepairer struct {
+	err   error
+	calls *int
+}
+
+func (pushRepairer) Safe(contract.Record) bool   { return true }
+func (pushRepairer) Term(contract.Record) string { return term.NeedsOperator }
+func (p pushRepairer) Repair(context.Context, contract.Record) (string, error) {
+	if p.calls != nil {
+		*p.calls = *p.calls + 1
+	}
+	return "push failed\n", p.err
+}
+
+func TestPassEscalatesAnUnpushedBackup(t *testing.T) {
+	h := newHarness(t, backupDrift())
+	for i := 0; i < EscalateAfterAttempts; i++ {
+		if _, err := h.engine.Pass(context.Background()); err != nil {
+			t.Fatalf("pass %d: %v", i, err)
+		}
+	}
+	item := h.queued(t)["backup-demo"]
+	if item.Term != term.Escalated {
+		t.Errorf("term %q after %d passes, want %q", item.Term, EscalateAfterAttempts, term.Escalated)
+	}
+	if item.Attempts != EscalateAfterAttempts {
+		t.Errorf("attempts %d, want %d", item.Attempts, EscalateAfterAttempts)
+	}
+}
+
+func TestPassStopsRetryingATerminalPush(t *testing.T) {
+	h := newHarness(t, backupStale())
+	calls := 0
+	h.engine.repairer = pushRepairer{
+		err:   &measure.PushError{Kind: "protected", Err: errors.New("protected branch")},
+		calls: &calls,
+	}
+
+	if _, err := h.engine.Pass(context.Background()); err != nil {
+		t.Fatalf("Pass: %v", err)
+	}
+	item := h.queued(t)["backup-demo"]
+	if item.Term != term.NeedsOperator {
+		t.Errorf("term %q, want %q", item.Term, term.NeedsOperator)
+	}
+	if item.Blocked != "protected" {
+		t.Errorf("blocked %q, want protected", item.Blocked)
+	}
+	if !item.NextAttemptAt.IsZero() {
+		t.Errorf("next attempt %v, want no retry scheduled", item.NextAttemptAt)
+	}
+
+	// A second pass must not run the terminal repair again, even though the
+	// measurement still reports a stale checkout.
+	if _, err := h.engine.Pass(context.Background()); err != nil {
+		t.Fatalf("second Pass: %v", err)
+	}
+	if calls != 1 {
+		t.Errorf("repair ran %d times, want 1: a terminal failure was retried", calls)
+	}
+}
+
+func TestDeferClearsATerminalPush(t *testing.T) {
+	h := newHarness(t, backupStale())
+	h.engine.repairer = pushRepairer{err: &measure.PushError{Kind: "auth", Err: errors.New("permission denied")}}
+	if _, err := h.engine.Pass(context.Background()); err != nil {
+		t.Fatalf("Pass: %v", err)
+	}
+	if _, err := h.engine.Defer("backup-demo", 2*time.Minute, "rotated the deploy key"); err != nil {
+		t.Fatalf("Defer: %v", err)
+	}
+	item := h.queued(t)["backup-demo"]
+	if item.Blocked != "" {
+		t.Errorf("blocked %q after a deferral, want cleared", item.Blocked)
+	}
+	if item.Term != term.Deferred {
+		t.Errorf("term %q, want %q", item.Term, term.Deferred)
+	}
+}
+
+func TestPassRetriesANetworkPushWithBackoff(t *testing.T) {
+	h := newHarness(t, backupStale())
+	h.engine.repairer = pushRepairer{err: &measure.PushError{Kind: "network", Err: errors.New("connection refused")}}
+
+	if _, err := h.engine.Pass(context.Background()); err != nil {
+		t.Fatalf("Pass: %v", err)
+	}
+	item := h.queued(t)["backup-demo"]
+	if item.Term != term.DidNotHold {
+		t.Errorf("term %q, want %q", item.Term, term.DidNotHold)
+	}
+	if want := fixedNow.Add(15 * time.Minute); !item.NextAttemptAt.Equal(want) {
+		t.Errorf("next attempt %v, want %v", item.NextAttemptAt, want)
 	}
 }
 
