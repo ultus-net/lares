@@ -25,7 +25,6 @@ func isolateGit(t *testing.T) {
 	}
 	for _, name := range vars {
 		value, had := os.LookupEnv(name)
-		name, value, had := name, value, had
 		if err := os.Unsetenv(name); err != nil {
 			t.Fatalf("unset %s: %v", name, err)
 		}
@@ -82,6 +81,9 @@ type scratch struct {
 // newScratch builds a bare remote and a clean work checkout with one commit.
 func newScratch(t *testing.T) *scratch {
 	t.Helper()
+	if _, err := exec.LookPath("git"); err != nil {
+		t.Skip("git is not installed")
+	}
 	isolateGit(t)
 	root := t.TempDir()
 	remote := filepath.Join(root, "remote.git")
@@ -315,5 +317,93 @@ func TestBackupLiveRequiresBilateralConvergence(t *testing.T) {
 	}
 	if rec := s.check(t); rec.State != contract.Live {
 		t.Fatalf("state %q (%s) after the upstream was restored, want live", rec.State, rec.Detail)
+	}
+}
+
+func TestBackupCreatesOnAnEmptyRemote(t *testing.T) {
+	s := newScratch(t)
+	// An empty remote has no refs and no default branch. That must not read as
+	// an undetermined default: the first backup has to be able to create it.
+	git(t, s.remote, "update-ref", "-d", "refs/heads/main")
+
+	if rec := s.check(t); rec.State != contract.Stale {
+		t.Fatalf("state %q (%s), want stale: the first backup must be pushable", rec.State, rec.Detail)
+	}
+	if _, err := s.e.pushBackup(context.Background(), s.work, backupSlug); err != nil {
+		t.Fatalf("first push to an empty remote: %v", err)
+	}
+	if got := s.branch(t, backupTarget); got == "" {
+		t.Fatal("the first push to an empty remote created no branch")
+	}
+}
+
+func TestBackupPushesNoTagsOrNotes(t *testing.T) {
+	s := newScratch(t)
+	git(t, s.work, "tag", "-a", "v1", "-m", "release")
+	git(t, s.work, "notes", "add", "-m", "a note on HEAD")
+	if _, err := s.e.pushBackup(context.Background(), s.work, backupSlug); err != nil {
+		t.Fatalf("push: %v", err)
+	}
+	extra := git(t, s.remote, "for-each-ref", "--format=%(refname)", "refs/tags", "refs/notes")
+	if extra != "" {
+		t.Fatalf("pushed refs outside the backup namespace:\n%s", extra)
+	}
+}
+
+func TestBackupNeverForcesAndKeepsTheRefspec(t *testing.T) {
+	s := newScratch(t)
+	var calls [][]string
+	inner := s.e.run
+	s.e.run = func(ctx context.Context, dir string, argv []string) ([]byte, error) {
+		calls = append(calls, append([]string(nil), argv...))
+		return inner(ctx, dir, argv)
+	}
+	if _, err := s.e.pushBackup(context.Background(), s.work, backupSlug); err != nil {
+		t.Fatalf("push: %v", err)
+	}
+	sawPush := false
+	for _, argv := range calls {
+		sub := false
+		for _, arg := range argv {
+			if arg == "push" {
+				sub = true
+				break
+			}
+		}
+		if !sub {
+			continue
+		}
+		line := strings.Join(argv, " ")
+		if strings.Contains(line, "--force") || strings.Contains(line, " push -f") {
+			t.Fatalf("push argv forces: %s", line)
+		}
+		if refspec := argv[len(argv)-1]; refspec != backupTarget+":refs/heads/"+backupTarget {
+			t.Errorf("refspec %q, want the backup namespace only", refspec)
+		}
+		sawPush = true
+	}
+	if !sawPush {
+		t.Fatal("no push argv was recorded")
+	}
+}
+
+func TestBackupUsesGITSSHCommand(t *testing.T) {
+	s := newScratch(t)
+	// Route the remote through ssh and give git a script that runs the served
+	// command locally. The push can only succeed when the child inherits
+	// GIT_SSH_COMMAND, which is the credential mechanism the contract names.
+	script := filepath.Join(t.TempDir(), "fake-ssh")
+	writeFile(t, script, "#!/bin/sh\nshift\nexec sh -c \"$*\"\n")
+	if err := os.Chmod(script, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	git(t, s.work, "remote", "set-url", "origin", "ssh://git@example.invalid"+s.remote)
+	t.Setenv("GIT_SSH_COMMAND", script)
+
+	if _, err := s.e.pushBackup(context.Background(), s.work, backupSlug); err != nil {
+		t.Fatalf("push with GIT_SSH_COMMAND: %v", err)
+	}
+	if got := s.branch(t, backupTarget); got == "" {
+		t.Fatal("the push over ssh created no branch")
 	}
 }

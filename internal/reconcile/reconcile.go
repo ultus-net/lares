@@ -295,12 +295,6 @@ func (e *Engine) Pass(ctx context.Context) (Result, error) {
 		}
 		if !e.repairer.Safe(rec) {
 			item.Term = e.repairer.Term(rec)
-			if isBackupItem(rec.ID) {
-				item.Attempts++
-				if item.Attempts >= EscalateAfterAttempts {
-					item.Term = term.Escalated
-				}
-			}
 			next.Items = append(next.Items, item)
 			result.Queued = append(result.Queued, rec.ID)
 			continue
@@ -340,10 +334,10 @@ func (e *Engine) Pass(ctx context.Context) (Result, error) {
 			item.Blocked = kind
 			item.Term = term.NeedsOperator
 			item.NextAttemptAt = time.Time{}
-		}
-		if isBackupItem(rec.ID) && item.Attempts >= EscalateAfterAttempts {
-			// On a single-disk host the checkout is the only copy, so an
-			// unpushed backlog outranks the rest of the punch list.
+		} else if isBackupItem(rec.ID) && item.Attempts >= EscalateAfterAttempts {
+			// On a single-disk host the checkout is the only copy, so a
+			// retryable unpushed backlog outranks the rest of the punch list.
+			// A terminal failure keeps needs-operator: retrying cannot help.
 			item.Term = term.Escalated
 		}
 		next.Items = append(next.Items, item)

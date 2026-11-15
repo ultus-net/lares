@@ -86,8 +86,9 @@ All notable changes to this project are recorded here. The format follows
   namespace, and reads no secret.
 - Push failures are classified. A protected branch, a diverged remote, and an
   auth failure queue as `needs-operator` and are not retried blind. A network
-  fault retries with backoff. An unpushed backup that survives three passes is
-  `escalated` and outranks the rest of the punch list.
+  fault retries with backoff. An unpushed backup whose retryable push fails
+  three times is `escalated` and outranks the rest of the punch list. A terminal
+  failure never escalates.
 - The safe set is the repository fast-forward and the outbound push. Every other
   repair queues with the precondition that blocked it: `needs-grant` for a
   staged deployment or a privileged verb, and `needs-operator` for a dirty

@@ -276,15 +276,6 @@ func backupStale() []contract.Record {
 	}
 }
 
-// backupDrift is one unsafe backup finding: the remote diverged, so no repair
-// is attempted.
-func backupDrift() []contract.Record {
-	return []contract.Record{
-		rec("backup-demo", contract.NotLive, "push"),
-		summary(contract.NotLive),
-	}
-}
-
 // pushRepairer fails every repair with a classified push error and counts the
 // calls, so a test can prove a terminal failure is not retried.
 type pushRepairer struct {
@@ -302,18 +293,51 @@ func (p pushRepairer) Repair(context.Context, contract.Record) (string, error) {
 }
 
 func TestPassEscalatesAnUnpushedBackup(t *testing.T) {
-	h := newHarness(t, backupDrift())
-	for i := 0; i < EscalateAfterAttempts; i++ {
-		if _, err := h.engine.Pass(context.Background()); err != nil {
-			t.Fatalf("pass %d: %v", i, err)
-		}
+	h := newHarness(t, backupStale())
+	if _, err := h.store.SaveQueue(state.Queue{Items: []state.Item{{
+		ID:        "backup-demo",
+		Term:      term.DidNotHold,
+		FirstSeen: fixedNow,
+		Attempts:  EscalateAfterAttempts - 1,
+	}}}); err != nil {
+		t.Fatalf("SaveQueue: %v", err)
+	}
+	// A network fault is retryable, so the failed attempt may escalate.
+	h.engine.repairer = pushRepairer{err: &measure.PushError{Kind: "network", Err: errors.New("connection refused")}}
+
+	if _, err := h.engine.Pass(context.Background()); err != nil {
+		t.Fatalf("Pass: %v", err)
 	}
 	item := h.queued(t)["backup-demo"]
 	if item.Term != term.Escalated {
-		t.Errorf("term %q after %d passes, want %q", item.Term, EscalateAfterAttempts, term.Escalated)
+		t.Errorf("term %q after %d attempts, want %q", item.Term, EscalateAfterAttempts, term.Escalated)
 	}
 	if item.Attempts != EscalateAfterAttempts {
 		t.Errorf("attempts %d, want %d", item.Attempts, EscalateAfterAttempts)
+	}
+}
+
+func TestPassNeverEscalatesATerminalPush(t *testing.T) {
+	h := newHarness(t, backupStale())
+	if _, err := h.store.SaveQueue(state.Queue{Items: []state.Item{{
+		ID:        "backup-demo",
+		Term:      term.DidNotHold,
+		FirstSeen: fixedNow,
+		Attempts:  EscalateAfterAttempts - 1,
+	}}}); err != nil {
+		t.Fatalf("SaveQueue: %v", err)
+	}
+	h.engine.repairer = pushRepairer{err: &measure.PushError{Kind: "diverged", Err: errors.New("non-fast-forward")}}
+
+	if _, err := h.engine.Pass(context.Background()); err != nil {
+		t.Fatalf("Pass: %v", err)
+	}
+	item := h.queued(t)["backup-demo"]
+	if item.Term != term.NeedsOperator {
+		t.Errorf("term %q, want %q: a terminal push must not escalate", item.Term, term.NeedsOperator)
+	}
+	if item.Blocked != "diverged" {
+		t.Errorf("blocked %q, want diverged", item.Blocked)
 	}
 }
 

@@ -33,6 +33,67 @@ func (e *PushError) Unwrap() error { return e.Err }
 // Retryable reports whether the failure is a transient network fault.
 func (e *PushError) Retryable() bool { return e.Kind == "network" }
 
+// backupState is one checkout's outbound position against its backup branch.
+type backupState struct {
+	remote string
+	target string
+	head   string
+	tip    string
+	exists bool
+	ahead  int
+	behind int
+}
+
+// readBackup runs the preconditions shared by the check and the repair, then
+// reads the backup branch after a fetch. One function owns the guards so a
+// safety rule cannot exist on one path and be missing from the other.
+func (e *Engine) readBackup(ctx context.Context, dir, slug string) (backupState, error) {
+	st, err := e.readRepo(ctx, dir)
+	if err != nil {
+		return backupState{}, err
+	}
+	if st.dirty > 0 {
+		return backupState{}, &PushError{Kind: "precondition", Err: fmt.Errorf("%d uncommitted paths; refusing to push", st.dirty)}
+	}
+	if st.head == "" || st.head == "(detached)" {
+		return backupState{}, &PushError{Kind: "precondition", Err: errors.New("HEAD is detached; refusing to push")}
+	}
+	remote, err := e.repoRemote(ctx, dir)
+	if err != nil {
+		return backupState{}, classifyGitError("locate remote", err)
+	}
+	target := e.backupBranch(slug)
+	def, err := e.remoteDefault(ctx, dir, remote)
+	if err != nil {
+		return backupState{}, classifyGitError("read "+remote+" default branch", err)
+	}
+	if target == def {
+		return backupState{}, &PushError{Kind: "protected", Err: fmt.Errorf("%s is the remote default branch; refusing", target)}
+	}
+	head, err := e.head(ctx, dir)
+	if err != nil {
+		return backupState{}, &PushError{Kind: "precondition", Err: errors.New("no commit to back up")}
+	}
+	bs := backupState{remote: remote, target: target, head: head}
+	tip, exists, err := e.lsRemoteBranch(ctx, dir, remote, target)
+	if err != nil {
+		return backupState{}, classifyGitError("read "+target, err)
+	}
+	bs.tip, bs.exists = tip, exists
+	if !exists {
+		return bs, nil
+	}
+	if err := e.fetchBackup(ctx, dir, remote, target); err != nil {
+		return backupState{}, classifyGitError("fetch "+target, err)
+	}
+	ahead, behind, err := e.aheadBehind(ctx, dir, "HEAD", "refs/remotes/"+remote+"/"+target)
+	if err != nil {
+		return backupState{}, err
+	}
+	bs.ahead, bs.behind = ahead, behind
+	return bs, nil
+}
+
 // backupCheck measures one checkout's outbound backup.
 //
 // The target is backup/<host>/<repo>. The check is safe only while the local
@@ -45,61 +106,27 @@ func (e *Engine) backupCheck(id, slug, dir string) check {
 		safe: true,
 		verb: "push",
 		run: func(ctx context.Context) (contract.State, string, error) {
-			st, err := e.readRepo(ctx, dir)
+			bs, err := e.readBackup(ctx, dir, slug)
 			if err != nil {
-				return contract.Unknown, "", err
+				return pushState("backup", err)
 			}
-			if st.dirty > 0 {
-				return contract.NotLive, fmt.Sprintf("%d uncommitted paths; refusing to push", st.dirty), nil
-			}
-			if st.head == "" || st.head == "(detached)" {
-				return contract.NotLive, "detached HEAD; refusing to push", nil
-			}
-			remote, err := e.repoRemote(ctx, dir)
-			if err != nil {
-				return pushState("locate remote", err)
-			}
-			target := e.backupBranch(slug)
-			def, err := e.remoteDefault(ctx, dir, remote)
-			if err != nil {
-				return pushState("read "+remote+" default branch", err)
-			}
-			if target == def {
-				return contract.NotLive, "backup target is the remote default branch; refusing", nil
-			}
-			head, err := e.head(ctx, dir)
-			if err != nil {
-				return contract.NotLive, "no commit to back up", nil
-			}
-			sha, exists, err := e.lsRemoteBranch(ctx, dir, remote, target)
-			if err != nil {
-				return pushState("read "+target, err)
-			}
-			if !exists {
-				return contract.Stale, "no backup branch " + target + "; push creates it", nil
-			}
-			if err := e.fetchBackup(ctx, dir, remote, target); err != nil {
-				return pushState("fetch "+target, err)
-			}
-			tracking := "refs/remotes/" + remote + "/" + target
-			ahead, behind, err := e.aheadBehind(ctx, dir, "HEAD", tracking)
-			if err != nil {
-				return contract.Unknown, "", err
+			if !bs.exists {
+				return contract.Stale, "no backup branch " + bs.target + "; push creates it", nil
 			}
 			// Convergence is bilateral: the remote tip, the local tracking ref,
 			// and HEAD must all agree. A push exit code alone proves nothing.
-			if ahead == 0 && behind == 0 && sha == head && e.upstreamMatches(ctx, dir, target, head) {
-				return contract.Live, "backup " + target + " matches HEAD", nil
+			if bs.ahead == 0 && bs.behind == 0 && bs.tip == bs.head && e.upstreamMatches(ctx, dir, bs.target, bs.head) {
+				return contract.Live, "backup " + bs.target + " matches HEAD", nil
 			}
 			switch {
-			case ahead > 0 && behind > 0:
-				return contract.NotLive, fmt.Sprintf("diverged from %s (%d ahead, %d behind); never force", target, ahead, behind), nil
-			case behind > 0:
-				return contract.NotLive, fmt.Sprintf("backup %s is %d commits ahead; never force", target, behind), nil
-			case ahead > 0:
-				return contract.Stale, fmt.Sprintf("%d commits ahead of %s; push", ahead, target), nil
+			case bs.ahead > 0 && bs.behind > 0:
+				return contract.NotLive, fmt.Sprintf("diverged from %s (%d ahead, %d behind); never force", bs.target, bs.ahead, bs.behind), nil
+			case bs.behind > 0:
+				return contract.NotLive, fmt.Sprintf("backup %s is %d commits ahead; never force", bs.target, bs.behind), nil
+			case bs.ahead > 0:
+				return contract.Stale, fmt.Sprintf("%d commits ahead of %s; push", bs.ahead, bs.target), nil
 			default:
-				return contract.Stale, "backup branch matches HEAD; refresh the local tracking ref", nil
+				return contract.Stale, "backup matches HEAD but the local upstream is missing or stale; refresh it", nil
 			}
 		},
 		repair: func(ctx context.Context) (string, error) {
@@ -125,78 +152,45 @@ func (e *Engine) backupBranch(slug string) string {
 // name the new HEAD.
 func (e *Engine) pushBackup(ctx context.Context, dir, slug string) (string, error) {
 	var log strings.Builder
-	st, err := e.readRepo(ctx, dir)
+	bs, err := e.readBackup(ctx, dir, slug)
 	if err != nil {
 		return log.String(), err
 	}
-	if st.dirty > 0 {
-		return log.String(), &PushError{Kind: "precondition", Err: errors.New("worktree has uncommitted paths; refusing to push")}
-	}
-	if st.head == "" || st.head == "(detached)" {
-		return log.String(), &PushError{Kind: "precondition", Err: errors.New("HEAD is detached; refusing to push")}
-	}
-	remote, err := e.repoRemote(ctx, dir)
-	if err != nil {
-		return log.String(), classifyGitError("locate remote", err)
-	}
-	target := e.backupBranch(slug)
-	def, err := e.remoteDefault(ctx, dir, remote)
-	if err != nil {
-		return log.String(), classifyGitError("read "+remote+" default branch", err)
-	}
-	if target == def {
-		return log.String(), &PushError{Kind: "protected", Err: fmt.Errorf("%s is the remote default branch; refusing", target)}
-	}
-	head, err := e.head(ctx, dir)
-	if err != nil {
-		return log.String(), &PushError{Kind: "precondition", Err: errors.New("no commit to back up")}
-	}
-	_, exists, err := e.lsRemoteBranch(ctx, dir, remote, target)
-	if err != nil {
-		return log.String(), classifyGitError("read "+target, err)
-	}
-	if exists {
-		if err := e.fetchBackup(ctx, dir, remote, target); err != nil {
-			return log.String(), classifyGitError("fetch "+target, err)
+	if bs.behind > 0 {
+		kind := "diverged"
+		if bs.ahead == 0 {
+			kind = "non-fast-forward"
 		}
-		ahead, behind, err := e.aheadBehind(ctx, dir, "HEAD", "refs/remotes/"+remote+"/"+target)
-		if err != nil {
-			return log.String(), err
-		}
-		if behind > 0 {
-			kind := "diverged"
-			if ahead == 0 {
-				kind = "non-fast-forward"
-			}
-			return log.String(), &PushError{Kind: kind, Err: fmt.Errorf("%s is %d commits ahead of HEAD; never force", target, behind)}
-		}
+		return log.String(), &PushError{Kind: kind, Err: fmt.Errorf("%s is %d commits ahead of HEAD; never force", bs.target, bs.behind)}
 	}
-	if err := e.ensureBackupBranch(ctx, dir, target); err != nil {
+	if err := e.ensureBackupBranch(ctx, dir, bs.target); err != nil {
 		return log.String(), err
 	}
 
-	argv := []string{"git", "push", "--porcelain", "--set-upstream", remote, target + ":refs/heads/" + target}
+	// Ambient push.followTags would send reachable annotated tags, which the
+	// contract forbids. Disable it for this push rather than trusting config.
+	argv := []string{"git", "-c", "push.followTags=false", "push", "--porcelain", "--set-upstream", bs.remote, bs.target + ":refs/heads/" + bs.target}
 	out, err := e.pushRun(ctx, dir, argv)
 	log.Write(out)
 	if err != nil {
-		return log.String(), classifyGitError("push "+target, err)
+		return log.String(), classifyGitError("push "+bs.target, err)
 	}
 
-	after, ok, err := e.lsRemoteBranch(ctx, dir, remote, target)
+	after, ok, err := e.lsRemoteBranch(ctx, dir, bs.remote, bs.target)
 	if err != nil {
-		return log.String(), classifyGitError("verify "+target, err)
+		return log.String(), classifyGitError("verify "+bs.target, err)
 	}
 	if !ok {
 		return log.String(), &PushError{Kind: "verify", Err: errors.New("push reported success but the remote branch is absent")}
 	}
-	if after != head {
-		return log.String(), &PushError{Kind: "verify", Err: fmt.Errorf("remote reports %s, want %s", after, head)}
+	if after != bs.head {
+		return log.String(), &PushError{Kind: "verify", Err: fmt.Errorf("remote reports %s, want %s", after, bs.head)}
 	}
-	if err := e.fetchBackup(ctx, dir, remote, target); err != nil {
-		return log.String(), classifyGitError("verify "+target, err)
+	if err := e.fetchBackup(ctx, dir, bs.remote, bs.target); err != nil {
+		return log.String(), classifyGitError("verify "+bs.target, err)
 	}
-	if !e.upstreamMatches(ctx, dir, target, head) {
-		return log.String(), &PushError{Kind: "verify", Err: fmt.Errorf("%s does not track HEAD after the push", target)}
+	if !e.upstreamMatches(ctx, dir, bs.target, bs.head) {
+		return log.String(), &PushError{Kind: "verify", Err: fmt.Errorf("%s does not track HEAD after the push", bs.target)}
 	}
 	return log.String(), nil
 }
@@ -234,7 +228,9 @@ func (e *Engine) repoRemote(ctx context.Context, dir string) (string, error) {
 }
 
 // remoteDefault resolves the remote's default branch with ls-remote --symref.
-// It never compares against a literal branch name.
+// It never compares against a literal branch name. An empty remote has no refs
+// and no default branch to collide with, so it returns "" and the first backup
+// may create its branch.
 func (e *Engine) remoteDefault(ctx context.Context, dir, remote string) (string, error) {
 	out, err := e.networkRun(ctx, dir, []string{"git", "ls-remote", "--symref", remote, "HEAD"})
 	if err != nil {
@@ -245,6 +241,9 @@ func (e *Engine) remoteDefault(ctx context.Context, dir, remote string) (string,
 		if len(fields) >= 3 && fields[0] == "ref:" && strings.HasPrefix(fields[1], "refs/heads/") {
 			return strings.TrimPrefix(fields[1], "refs/heads/"), nil
 		}
+	}
+	if strings.TrimSpace(string(out)) == "" {
+		return "", nil
 	}
 	return "", errors.New("remote did not report a default branch")
 }
@@ -314,13 +313,25 @@ func (e *Engine) upstreamMatches(ctx context.Context, dir, branch, head string) 
 }
 
 // ensureBackupBranch points a local branch at HEAD without touching the
-// checkout. A branch that is already checked out is left alone.
+// checkout. A branch that is already checked out is left alone. An existing
+// branch moves only forward; refusing a backward move keeps the
+// never-rewrite-history rule true on the local side too.
 func (e *Engine) ensureBackupBranch(ctx context.Context, dir, branch string) error {
 	out, err := e.run(ctx, dir, []string{"git", "symbolic-ref", "--quiet", "--short", "HEAD"})
 	if err == nil && strings.TrimSpace(string(out)) == branch {
 		return nil
 	}
-	if _, err := e.run(ctx, dir, []string{"git", "branch", "-f", branch, "HEAD"}); err != nil {
+	local := "refs/heads/" + branch
+	if _, err := e.run(ctx, dir, []string{"git", "rev-parse", "--verify", "--quiet", local}); err == nil {
+		if _, err := e.run(ctx, dir, []string{"git", "merge-base", "--is-ancestor", local, "HEAD"}); err != nil {
+			return &PushError{Kind: "precondition", Err: fmt.Errorf("local %s holds commits not in HEAD; refusing to rewrite it", branch)}
+		}
+		if _, err := e.run(ctx, dir, []string{"git", "branch", "-f", branch, "HEAD"}); err != nil {
+			return classifyGitError("update local backup branch", err)
+		}
+		return nil
+	}
+	if _, err := e.run(ctx, dir, []string{"git", "branch", branch, "HEAD"}); err != nil {
 		return classifyGitError("create local backup branch", err)
 	}
 	return nil

@@ -116,11 +116,13 @@ A push exit code alone is not evidence, the same way a version print is not
 evidence that a service is up.
 
 The push runs only when the checkout is clean, on a branch, the remote is
-reachable, nothing is staged, and no live hold exists. It never forces, never
-rewrites history, never deletes an unmerged branch, never pushes tags, notes, or
-refs outside the backup namespace, and never pushes to the remote's default
-branch. The default branch is read with `git ls-remote --symref <remote> HEAD`,
-so the refusal holds for `main`, `master`, `trunk`, or any other name.
+reachable, no path is uncommitted, and no live hold exists. It never forces,
+never rewrites history, never deletes an unmerged branch, never pushes tags,
+notes, or refs outside the backup namespace, and never pushes to the remote's
+default branch. The default branch is read with `git ls-remote --symref
+<remote> HEAD`, so the refusal holds for `main`, `master`, `trunk`, or any other
+name. An empty remote reports no default branch, and the first backup may create
+its branch there.
 
 Failures are classified, never retried blind:
 
@@ -131,9 +133,10 @@ Failures are classified, never retried blind:
 | auth, missing deploy key | terminal until the operator acts |
 | network, DNS, timeout | retryable with backoff |
 
-An unpushed backup that survives three passes is `escalated` and outranks the
-rest of the punch list, because on a single-disk host the checkout is the only
-copy.
+An unpushed backup whose retryable push fails three times is `escalated` and
+outranks the rest of the punch list, because on a single-disk host the checkout
+is the only copy. A terminal failure never escalates: retrying cannot help, so it
+stays `needs-operator`.
 
 A terminal failure persists in the queue as `needs-operator` with `blocked`
 naming its kind, and no pass retries it. It leaves the queue when a measurement
@@ -195,7 +198,7 @@ Everything else queues, with the precondition that blocked it:
 | `fix-did-not-hold` | the repair ran and verification saw no movement |
 | `backoff` | the item is due, but its retry delay has not elapsed |
 | `deferred` | the operator moved it out |
-| `escalated` | an unpushed backup survived three passes; it outranks the punch list |
+| `escalated` | an unpushed backup failed three retryable pushes; it outranks the punch list |
 
 `patch-train` needs a sudo grant, and a staged deployment needs a reboot. A
 dirty or ahead repository needs a person. A diverged or protected backup needs a
@@ -207,11 +210,11 @@ A failed converge increments `attempts` and sets `next_attempt_at` to now plus
 the resync interval doubled per attempt, capped at one day. A repair that cannot
 work costs one attempt per day, not one per resync.
 
-A classified terminal push failure does not schedule a retry. It queues as
-`needs-operator`, and the next measurement decides whether the remote became
-pushable again. A network push failure retries with the normal backoff. Every
-consecutive pass a backup item stays un-live increments `attempts`; at three it
-becomes `escalated`.
+A classified terminal push failure does not schedule a retry. It stays
+`needs-operator` with `blocked` until a measurement proves the item live, or the
+operator clears the block with a deferral. A network push failure retries with
+the normal backoff. Each failed retryable push increments `attempts`; at three
+the item becomes `escalated`.
 
 ## Holds
 
