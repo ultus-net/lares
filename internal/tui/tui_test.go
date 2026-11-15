@@ -36,11 +36,10 @@ func newModel(t *testing.T, records ...[]contract.Record) Model {
 	}
 	index := 0
 	engine, err := reconcile.New(reconcile.Options{
-		Config:  cfg,
-		Store:   store,
-		Family:  adapter.Arch,
-		RepoDir: store.Dir(),
-		Now:     func() time.Time { return base },
+		Config: cfg,
+		Store:  store,
+		Family: adapter.Arch,
+		Now:    func() time.Time { return base },
 		Measure: func(context.Context) ([]contract.Record, error) {
 			if len(records) == 0 {
 				return []contract.Record{{ID: contract.SummaryID, State: contract.Live}}, nil
@@ -52,7 +51,6 @@ func newModel(t *testing.T, records ...[]contract.Record) Model {
 			index++
 			return records[i], nil
 		},
-		Run:      func(context.Context, string, []string) (string, error) { return "", nil },
 		Sleep:    func(context.Context, time.Duration) error { return nil },
 		Session:  func(context.Context) (bool, error) { return false, nil },
 		Train:    func(context.Context) (bool, error) { return false, nil },

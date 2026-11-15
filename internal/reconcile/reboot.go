@@ -13,18 +13,20 @@ import (
 
 	"github.com/ultus-net/lares/internal/adapter"
 	"github.com/ultus-net/lares/internal/state"
+	"github.com/ultus-net/lares/internal/term"
 )
 
 // RebootID is the queue item that carries a blocked reboot.
 const RebootID = "reboot"
 
-// Reboot terms, in the order the gate evaluates them.
+// Reboot terms, in the order the gate evaluates them. Hold and Scan come from
+// the shared term vocabulary so the measure engine and the gate never drift.
 const (
 	TermWindow = "window"
-	TermHold   = "hold"
+	TermHold   = term.Hold
 	// TermScan means no process could be checked, so an unclaimed agent cannot
 	// be ruled out. It is not a hold the operator wrote.
-	TermScan    = "scan"
+	TermScan    = term.Scan
 	TermSession = "session"
 	TermOwnJob  = "own-job"
 )
@@ -320,10 +322,11 @@ func defaultSessionActive(ctx context.Context) (bool, error) {
 // trainProcesses names the programs that hold an update lock on a family.
 //
 // Fedora has no lock file the way Omarchy does, so the check looks for the
-// transaction program itself.
+// transaction program itself. A bootc host may still be updated by rpm-ostree,
+// as the Universal Blue images are, so either process holds the train.
 var trainProcesses = map[adapter.Family][]string{
 	adapter.FedoraAtomic: {"rpm-ostree"},
-	adapter.Bootc:        {"bootc"},
+	adapter.Bootc:        {"bootc", "rpm-ostree"},
 }
 
 // runningCommands lists the command names in /proc. Tests replace it.
