@@ -356,8 +356,10 @@ func (s *Store) pruneVerdicts(cutoff time.Time) error {
 	}
 
 	var kept bytes.Buffer
+	stale := false
 	for _, v := range verdicts {
 		if v.At.Before(cutoff) {
+			stale = true
 			continue
 		}
 		line, err := json.Marshal(v)
@@ -366,6 +368,9 @@ func (s *Store) pruneVerdicts(cutoff time.Time) error {
 		}
 		kept.Write(line)
 		kept.WriteByte('\n')
+	}
+	if !stale {
+		return nil
 	}
 
 	tmp := s.verdictPath() + ".tmp"

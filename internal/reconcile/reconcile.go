@@ -206,6 +206,9 @@ func (e *Engine) Pass(ctx context.Context) (Result, error) {
 			return result, err
 		}
 	}
+	if err := e.store.Prune(now); err != nil {
+		return result, err
+	}
 
 	previous, _, err := e.store.Queue()
 	if err != nil && !errors.Is(err, state.ErrNoQueue) {
