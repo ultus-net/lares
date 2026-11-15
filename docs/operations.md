@@ -104,13 +104,22 @@ can_reboot = window_open AND no_hold AND no_interactive_session AND no_own_job
 | `window` | the local clock is outside `window_start`-`window_end` |
 | `hold` | any live hold exists, or a live `opencode`/`orca` process has none |
 | `scan` | `/proc` could not be read, so no agent could be ruled out |
-| `session` | a session other than the user's manager is logged in, Omarchy's stay-awake marker exists, or `loginctl` cannot answer |
+| `session` | a session other than the user's manager is logged in, Omarchy's stay-awake marker exists, a `block` or `block-weak` inhibitor lock is held, or `loginctl` cannot answer |
 | `own-job` | an update transaction is running, or its state cannot be read |
 
 The term order is the evaluation order, so the queue names the first blocker.
 A blocked reboot is a queue item with that term, and it waits: nothing prompts,
 because a question at 03:00 is a hung timer. The verdict fails closed: an
 unreadable session state or train state blocks instead of guessing.
+
+Inhibitor locks come from `systemd-inhibit --list`. A lock with mode `block` or
+`block-weak` means a program asked the host to stay up: a build, a backup, or a
+recording. Mode `delay` only postpones a sleep request, so it does not block a
+reboot. The parser reads the mode from the end of each line, because the reason
+field may be empty or contain spaces. A line it cannot parse, or a failed call
+to `systemd-inhibit`, blocks the reboot instead of reporting an idle host. Arch
+and Fedora atomic both ship the command. A host without it fails the read, so
+the gate blocks rather than reading the host as idle.
 
 The train check is per family. Arch asks `omarchy-update-lock held`. Fedora
 atomic and bootc look for a running `rpm-ostree` or `bootc` process. A family
