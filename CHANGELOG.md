@@ -8,6 +8,19 @@ All notable changes to this project are recorded here. The format follows
 
 ### Added
 
+- An in-process Go measure engine. The host checks are `shell`, `patch-train`,
+  `systemd-failed`, and `disk`; a host needs no probe script and no checkout.
+- Repository checks. `repos_dir` is enumerated one level deep for immediate
+  children holding a `.git` entry, and an explicit `repos` list replaces
+  discovery. Each `repo-<name>` check fetches with a timeout, reads porcelain
+  status, and reports worktree records that git marks prunable.
+- `fast-forward`, the safe repair for a clean checkout that is behind its
+  upstream. It prunes dead worktree records, refuses a dirty checkout or an
+  unpushed commit, and never pushes or rewrites history.
+- `repos_dir` and `repos` in `config.toml`.
+- `reconcile.Measure`, so `lares measure` uses the same engine a pass does.
+- Measure tests for every host check, repository classification, discovery
+  bounds, and the repair's refusal paths.
 - The `hygiene-audit.sh --json` contract reader: one record per line, a summary
   record last, and a state of `live`, `not-live`, `stale`, or `unknown`.
 - An append-only verdict log, a queue with a generation counter and an atomic
@@ -34,7 +47,7 @@ All notable changes to this project are recorded here. The format follows
 - `lares hold add --pid N` holds another process, `lares hold exec -- cmd` holds
   for the life of a command, and holds carry the process start time so a reused
   pid cannot keep a stale hold alive.
-- `repo_dir` and `reboot_from_pass` in `config.toml`. A pass evaluates the
+- `reboot_from_pass` in `config.toml`. A pass evaluates the
   reboot gate last, under the lock it already holds.
 - A `bootc` adapter family, detected ahead of `rpm-ostree`.
 - Deferrals are appended to the verdict log as `defer` records and replayed, so
@@ -53,17 +66,43 @@ All notable changes to this project are recorded here. The format follows
 
 ### Changed
 
-- The safe set narrows to `profile`. Every other repair queues with the
-  precondition that blocked it: `needs-tty`, `needs-grant`, or
-  `needs-operator`. `maintenance`, `hermes`, and `notebook` cannot run
-  unattended: the first two open `/dev/tty` for sudo, and the third creates and
-  pushes a GitHub repository.
+- The safe set is the repository fast-forward. Every other repair queues with
+  the precondition that blocked it: `needs-grant` for a staged deployment or a
+  privileged verb, and `needs-operator` for a dirty checkout, a detached head, an
+  unpushed commit, a failed unit, or low disk.
+- `audit_command` is optional. An empty value measures the host in-process; a
+  non-empty value runs the external probe and queues every record it prints,
+  because lares did not produce the repair.
+- The installed service unit runs with `WorkingDirectory=%h`, and the installer
+  records `repos_dir` instead of a checkout.
 - Convergence requires a verification measurement that names the item and says
   `live`. A missing record and an `unknown` record both leave the item queued.
 - The reboot gate fails closed when the session state or the update train state
   cannot be read, and names a long-horizon process with no hold as `unclaimed`.
-  Fedora families find the transaction by process name; a family with no train
-  check blocks instead of reporting an idle train.
+  A bootc host counts a running `rpm-ostree` as well as a running `bootc`, so a
+  Universal Blue image that still updates through rpm-ostree cannot reboot
+  mid-transaction. Fedora families find the transaction by process name; a
+  family with no train check blocks instead of reporting an idle train.
+- `patch-train` reads the deployment state in a fixed order: `rpm-ostree status
+  --json`, then `ostree admin status --json`, then `bootc status --format json`.
+  rpm-ostree and ostree answer without root, so a standard Universal Blue image
+  that detects as `bootc` stays measurable. bootc is last because it demands
+  root on those images. The ostree reader carries no version, so the detail
+  names the deployment by checksum prefix.
+- `systemd-failed` ignores `systemd-remount-fs.service` on a Fedora atomic or
+  bootc host with a read-only root, where the unit fails on every boot because
+  an immutable composefs root cannot be remounted. The detail names the
+  exclusion, and every other failed unit stays a finding. A scope that
+  `systemctl` cannot read is named in the detail; when neither scope can be read
+  the record is `unknown`, so the check never reads an unreadable host as idle.
+- An unreadable `repos_dir` produces an `unknown` `repo-discovery` record
+  instead of an empty check set, so a missing or unreadable directory cannot
+  shrink the measurement to a clean host.
+- `repo_dir` is accepted and ignored, so a config written by the previous
+  installer still loads. `repos_dir` and `repos` replace it; delete the old key.
+- A repository fast-forward runs its safety checks before any mutating command,
+  so a refused repair leaves worktree bookkeeping untouched. A failed worktree
+  prune is recorded in the repair log instead of being discarded.
 - Hold owners and item ids must be slugs. A name that would need rewriting is
   rejected, so two identities never share one file.
 - An agent scan that cannot read `/proc` blocks a pass and a reboot under the
@@ -73,6 +112,11 @@ All notable changes to this project are recorded here. The format follows
 
 ### Removed
 
+- The dotfiles coupling: `repo_dir`, the `LARES_REPO` environment variable, and
+  the `--repo` flag. lares no longer reads a checkout to find a probe or a
+  repair.
+- The `hygiene-audit.sh` probe as the default measurement, and the
+  `install/profile-select.sh` repair as the safe set.
 - Sudoers generation. The installer never asks for a standing grant, so a
   repair that needs root stays queued.
 - `[s]etup` and `[c]lean` in the punch list, which had no handler.

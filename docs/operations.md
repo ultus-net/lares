@@ -10,9 +10,9 @@ interval.
 
 1. Take `lock`, so a second lares process exits instead of working the same
    items. `pass`, `reboot`, and every hold change share that lock.
-2. Run the probe (`hygiene-audit.sh --json`) and append one verdict per record.
+2. Run the in-process checks and append one verdict per record.
 3. Rebuild the queue from the findings, replaying any deferral from the log.
-4. For each finding in the safe set that is due, run its repair verb.
+4. For each finding in the safe set that is due, run its repair.
 5. Re-measure after 5 seconds, 30 seconds, and 5 minutes. The repair converged
    only when a verification names the item and says `live`. A missing record and
    an `unknown` record both leave the item queued.
@@ -23,30 +23,101 @@ is derived state: an item that stops being a finding leaves the queue, and its
 attempt count resets. A deferral is written to `verdicts.jsonl` as well, so a
 rebuilt queue keeps the operator's judgement.
 
+## Checks
+
+The checks are Go and read the host directly. There is no probe script and no
+checkout to find.
+
+| Item | Reads | Safe repair |
+| --- | --- | --- |
+| `shell` | the login shell field of the current uid in `/etc/passwd`; the path must be absolute, exist, and be executable | none |
+| `patch-train` | `rpm-ostree status --json`, then `ostree admin status --json`, then `bootc status --format json`, or the Arch version stamp | none |
+| `systemd-failed` | `systemctl --failed --no-legend --plain` for the system and the user | none |
+| `disk` | total and available bytes on `/` and the home directory | none |
+| `repo-<name>` | `git fetch --prune`, `git status --porcelain=v2 --branch`, and `git worktree list --porcelain` | `fast-forward` |
+
+A check that cannot read the host returns `unknown`. The queue shows the item
+with the `unverified` term and never repairs it. A family with no adapter
+reports `patch-train` as `unknown` instead of claiming the host is current.
+
+`systemd-failed` names a scope it could not read. If both scopes fail, the
+record is `unknown`, so an unreadable `systemctl` never looks like an idle host.
+
+`systemd-failed` excludes `systemd-remount-fs.service` on a Fedora atomic or
+bootc host whose root is read-only. An immutable composefs root cannot be
+remounted, so that unit fails on every boot and no operator action clears it.
+The detail names the exclusion whenever it applies. Every other failed unit
+stays a finding.
+
+### The patch train
+
+`patch-train` reports a staged deployment as `stale`. Staging needs root, so a
+staged deployment is `needs-grant` and waits for a person or the reboot gate,
+which activates it.
+
+The deployment state is read in a fixed order, and the first reader that
+answers wins:
+
+1. `rpm-ostree status --json` answers without root and carries the version. It
+   covers Fedora atomic and every Universal Blue image that still updates
+   through rpm-ostree, including a host detected as `bootc`.
+2. `ostree admin status --json` answers without root on any ostree host. It
+   keeps a bootc-only image measurable when rpm-ostree is absent. It carries no
+   version, so the detail names the deployment by checksum prefix.
+3. `bootc status --format json` is last because it demands root on the current
+   Universal Blue images. It only helps when lares runs privileged.
+
+A reader that fails or returns an unparsable document falls through to the next.
+When every reader fails, the check reports `unknown`. The Arch family reads the
+version stamp's modification time and reports `stale` when it is older than 35
+days.
+
+### Repositories
+
+`repos_dir` is enumerated one level deep: each immediate child that holds a
+`.git` entry is a repository, and an explicit `repos` list replaces discovery.
+The enumeration is capped at 200 directories and never walks a tree. A
+`repos_dir` that cannot be read is an `unknown` `repo-discovery` record, never an
+empty set, so a missing or unreadable directory cannot report the host healthy.
+
+Each check fetches with a 60 second timeout, so a behind count is current. A
+failed fetch keeps the last known remote refs; the detail says the fetch failed
+and the state is at worst stale, never wrong in the unsafe direction.
+
+| State | Meaning |
+| --- | --- |
+| `live` | clean and level with the upstream |
+| `stale` | clean, behind the upstream, or holding prunable worktree records |
+| `not-live` | uncommitted paths, a detached head, no upstream, or unpushed commits |
+
+Only a `stale` checkout is in the safe set. `fast-forward` prunes dead worktree
+records and runs `git merge --ff-only <upstream>`. It refuses a dirty worktree
+or a local commit the upstream does not have, so a repair can never discard
+work. It never pushes and never rewrites history.
+
 ## The safe set
 
 | Item | Verb |
 | --- | --- |
-| `profile` | `install/profile-select.sh <profile>` |
+| `repo-<name>` | `fast-forward` |
 
 Everything else queues, with the precondition that blocked it:
 
 | Term | Meaning |
 | --- | --- |
-| `needs-tty` | the repair calls `as_root`, which opens `/dev/tty` for sudo |
+| `needs-tty` | the repair would open `/dev/tty` for sudo |
 | `needs-grant` | the repair needs a privilege the host has not granted |
 | `needs-operator` | the repair writes to a remote or needs a judgement call |
-| `unverified` | the probe returned `unknown`, so no repair is safe |
+| `unverified` | the check returned `unknown`, so no repair is safe |
 | `hold` | a live hold is blocking disruptive work |
 | `scan` | `/proc` could not be read, so an unclaimed agent cannot be ruled out |
 | `fix-did-not-hold` | the repair ran and verification saw no movement |
 | `backoff` | the item is due, but its retry delay has not elapsed |
 | `deferred` | the operator moved it out |
 
-`maintenance` and `hermes` need a TTY. `patch-train` needs a sudo grant.
-`notebook` creates and pushes a GitHub repository, so it is never unattended.
-`offsite` needs a provider decision, `backup` needs a mount and a password, and
-branch cleanup needs a per-branch judgement.
+`patch-train` needs a sudo grant, and a staged deployment needs a reboot. A
+dirty or ahead repository needs a person. Everything lares cannot prove queues
+rather than running.
 
 ## Backoff
 
@@ -163,8 +234,8 @@ lares install --user
 
 Writes the binary, `lares.service`, `lares.timer`, `config.toml`, and
 `adapters.toml`. An existing config or adapter file is left alone; the binary
-and the units are replaced. The service unit gets `WorkingDirectory=<repo_dir>`,
-so the timer finds the probe in the checkout it was installed from.
+and the units are replaced. The service unit runs with `WorkingDirectory=%h`,
+so the timer needs no checkout. lares measures the host in-process.
 
 It prints one command and does not run it:
 
@@ -199,9 +270,17 @@ Detection order is Arch first, then Fedora with `bootc` present, then Fedora wit
 `rpm-ostree` present. A host that names neither measures and never acts.
 
 `config.toml`'s `adapter_override` names a section when detection is wrong.
-`repo_dir` is the checkout that holds the probe. `reboot_from_pass` (default
-true) decides whether a pass evaluates the reboot gate, and it exists so a host
-that reboots by hand can turn the gate off without editing the binary.
+`repos_dir` is the directory whose immediate children are checked, and `repos`
+replaces discovery with an explicit list. `reboot_from_pass` (default true)
+decides whether a pass evaluates the reboot gate, and it exists so a host that
+reboots by hand can turn the gate off without editing the binary.
+
+`repo_dir` is accepted and ignored so a config written by the previous installer
+still loads. Delete it; `repos_dir` and `repos` replace it.
+
+`audit_command` is optional. When set, lares runs that command instead of its
+in-process checks and queues every record it prints, because lares did not
+produce the repair.
 
 ## Troubleshooting
 
@@ -210,5 +289,7 @@ that reboots by hand can turn the gate off without editing the binary.
 | timer inactive | `systemctl --user status lares.timer` |
 | queue not moving | `lares status`; the item's `Term` names the blocker |
 | reboot never runs | `lares reboot --dry-run`; the term names the blocker |
-| probe fails | run the configured `audit_command` by hand with `--json` |
+| a check reports `unknown` | run the host tool it reads by hand; the detail names the failure |
+| a repository is not checked | `repos_dir` holds it one level deep, or `repos` names it |
+| a repository stays queued | `lares status`; a dirty or ahead checkout needs a person |
 | queue recovered from backup | `queue.json.corrupt-*` holds the file that was replaced |
