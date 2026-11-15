@@ -272,8 +272,8 @@ func isPID(name string) bool {
 // defaultSessionActive reports whether a person is still using the machine.
 //
 // A locked screen counts: the session is still there to lose work. Omarchy's
-// stay-awake marker counts, and so does an inhibitor a build left behind. The
-// check fails closed: if loginctl cannot answer, the host is treated as in use.
+// stay-awake marker counts too. The check fails closed: if loginctl cannot
+// answer, the host is treated as in use.
 func defaultSessionActive(ctx context.Context) (bool, error) {
 	if home, err := os.UserHomeDir(); err == nil {
 		marker := filepath.Join(home, ".local", "state", "omarchy", "indicators", "stay-awake")
