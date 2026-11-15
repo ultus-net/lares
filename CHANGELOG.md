@@ -20,3 +20,11 @@ All notable changes to this project are recorded here. The format follows
   train.
 - `lares install --user`, which writes the binary, the units, and the config,
   and prints the two privileged commands instead of running them.
+- The CLI: `measure`, `pass`, `status`, `hold add|list|rm`, `defer`, `reboot`,
+  `install`, and `tui`, with JSON output on `measure` and `status`.
+- A live `opencode` or `orca` process with no hold blocks a reboot and is named
+  in the verdict, so a forgotten hold fails safe.
+- The punch-list TUI (Bubble Tea): severity-ordered rows, one key per action,
+  the holds, and a raw-detail pane.
+- Verdict history pruned once per pass, with the rewrite skipped when nothing
+  expires.

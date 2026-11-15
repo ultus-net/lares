@@ -47,18 +47,22 @@ make build
 
 `lares install --user` writes the binary to `~/.local/bin/lares`, the units to
 `~/.config/systemd/user/lares.{service,timer}`, and the config to
-`~/.config/lares/{config.toml,adapters.toml}`. It prints the two commands it
-will not run for you: the sudoers drop-in and `loginctl enable-linger`.
+`~/.config/lares/{config.toml,adapters.toml,lares.sudoers}`. It prints the two
+commands it will not run for you: the sudoers drop-in and `loginctl
+enable-linger`. A re-install replaces the binary and the units and leaves an
+edited config alone.
 
 ## Commands
 
 ```text
 lares measure [--json]        measure once and print the verdicts
 lares pass                    one reconcile pass: measure, converge, queue
-lares status [--json]         the queue, the holds, and the last measure
+lares status [--json]         the queue, the holds, and the newest verdict
 lares hold add <reason>       write a hold for this process
 lares hold list               list holds, marking stale ones
+lares hold rm <owner>         remove a hold
 lares defer <id> <duration>   keep an item out of the queue for a while
+lares reboot [--dry-run]      evaluate the reboot gate
 lares install --user          write the binary, units, and config
 lares tui                     the punch list
 ```
