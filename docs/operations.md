@@ -93,13 +93,94 @@ and the state is at worst stale, never wrong in the unsafe direction.
 Only a `stale` checkout is in the safe set. `fast-forward` prunes dead worktree
 records and runs `git merge --ff-only <upstream>`. It refuses a dirty worktree
 or a local commit the upstream does not have, so a repair can never discard
-work. It never pushes and never rewrites history.
+work. The fast-forward itself never rewrites history.
+
+### Outbound backup
+
+REQUIREMENT (operator, 2026-11-16): pushes are mandatory. A local-only commit is
+not backed up, so every clean checkout is also pushed to
+`backup/<host>/<repo>` in its own remote. This is the mirror of the inbound
+fast-forward, and it supersedes the earlier rule that lares never pushes.
+
+The branch is created once with `--set-upstream` and reused on every later
+pass. A new branch per pass would fill the remote, trip the destination's CI,
+and make an item unable to reach `live` twice.
+
+The item is `live` only when convergence is bilateral, proved after a fetch:
+
+- `git ls-remote --exit-code` names the local `HEAD` as the remote tip.
+- the local tracking ref (`@{u}`) resolves to that same commit.
+- ahead and behind are both zero against `@{u}`.
+
+A push exit code alone is not evidence, the same way a version print is not
+evidence that a service is up.
+
+The push runs only when the checkout is clean, on a branch, the remote is
+reachable, nothing is staged, and no live hold exists. It never forces, never
+rewrites history, never deletes an unmerged branch, never pushes tags, notes, or
+refs outside the backup namespace, and never pushes to the remote's default
+branch. The default branch is read with `git ls-remote --symref <remote> HEAD`,
+so the refusal holds for `main`, `master`, `trunk`, or any other name.
+
+Failures are classified, never retried blind:
+
+| Failure | Handling |
+| --- | --- |
+| protected branch, default-branch target | terminal; queue as `needs-operator` |
+| non-fast-forward, diverged remote | terminal; queue, never force |
+| auth, missing deploy key | terminal until the operator acts |
+| network, DNS, timeout | retryable with backoff |
+
+An unpushed backup that survives three passes is `escalated` and outranks the
+rest of the punch list, because on a single-disk host the checkout is the only
+copy.
+
+A terminal failure persists in the queue as `needs-operator` with `blocked`
+naming its kind, and no pass retries it. It leaves the queue when a measurement
+proves the item live. When the operator fixes the cause, clear the block with a
+deferral, which lets the next attempt try again:
+
+```bash
+lares defer backup-<name> 2m "rotated the deploy key"
+```
+
+The destination is the source repository's own remote. If that repository runs
+workflows on every branch, exclude `backup/*` from its triggers. lares does not
+edit CI configuration.
+
+### Backup credentials and restore
+
+lares parses no token and opens no key. Provision a deploy key with write access
+to the destination repository only, and let git use it through
+`GIT_SSH_COMMAND`. Treat the key like `secrets.env`: the operator provisions it
+after install, it lives in no repository, and the restore procedure below names
+it so a reinstalled host rejoins.
+
+Add a systemd drop-in so the timer, not only an interactive shell, sees the key:
+
+```ini
+# ~/.config/systemd/user/lares.service.d/backup.conf
+[Service]
+Environment=GIT_SSH_COMMAND=ssh -i %h/.ssh/lares-backup -o IdentitiesOnly=yes
+```
+
+Then run `systemctl --user daemon-reload`.
+
+To restore a host:
+
+1. `lares install --user`.
+2. Provision `~/.ssh/lares-backup` and the drop-in above.
+3. Run `lares pass`. The first pass creates `backup/<host>/<repo>` when it is
+   absent, or reuses it and sets the local upstream when it exists.
+4. `lares status` lists `backup-<name>`. A `live` state means both the remote
+   tip and the local upstream name `HEAD`.
 
 ## The safe set
 
 | Item | Verb |
 | --- | --- |
 | `repo-<name>` | `fast-forward` |
+| `backup-<name>` | `push` |
 
 Everything else queues, with the precondition that blocked it:
 
@@ -114,16 +195,23 @@ Everything else queues, with the precondition that blocked it:
 | `fix-did-not-hold` | the repair ran and verification saw no movement |
 | `backoff` | the item is due, but its retry delay has not elapsed |
 | `deferred` | the operator moved it out |
+| `escalated` | an unpushed backup survived three passes; it outranks the punch list |
 
 `patch-train` needs a sudo grant, and a staged deployment needs a reboot. A
-dirty or ahead repository needs a person. Everything lares cannot prove queues
-rather than running.
+dirty or ahead repository needs a person. A diverged or protected backup needs a
+person. Everything lares cannot prove queues rather than running.
 
 ## Backoff
 
 A failed converge increments `attempts` and sets `next_attempt_at` to now plus
 the resync interval doubled per attempt, capped at one day. A repair that cannot
 work costs one attempt per day, not one per resync.
+
+A classified terminal push failure does not schedule a retry. It queues as
+`needs-operator`, and the next measurement decides whether the remote became
+pushable again. A network push failure retries with the normal backoff. Every
+consecutive pass a backup item stays un-live increments `attempts`; at three it
+becomes `escalated`.
 
 ## Holds
 

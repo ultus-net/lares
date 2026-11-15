@@ -16,7 +16,18 @@ All notable changes to this project are recorded here. The format follows
   status, and reports worktree records that git marks prunable.
 - `fast-forward`, the safe repair for a clean checkout that is behind its
   upstream. It prunes dead worktree records, refuses a dirty checkout or an
-  unpushed commit, and never pushes or rewrites history.
+  unpushed commit, and moves a branch only by fast-forward.
+- Outbound backup. Each clean checkout is pushed to `backup/<host>/<repo>` in
+  its own remote. The branch is created once with `--set-upstream` and reused on
+  later passes. The item is `live` only when the remote tip, the local tracking
+  ref, and `HEAD` agree after a fetch, and ahead and behind are both zero; a
+  push exit code alone is not evidence.
+- `backup-<name>` checks and the `push` repair. The push never forces, refuses
+  the remote default branch resolved with `git ls-remote --symref`, and never
+  pushes tags, notes, or refs outside the backup namespace.
+- Tests for the backup refusals: default-branch target, a diverged remote, a
+  rejected push, a credential file that is never read, branch reuse, and
+  bilateral convergence.
 - `repos_dir` and `repos` in `config.toml`.
 - `reconcile.Measure`, so `lares measure` uses the same engine a pass does.
 - Measure tests for every host check, repository classification, discovery
@@ -66,10 +77,21 @@ All notable changes to this project are recorded here. The format follows
 
 ### Changed
 
-- The safe set is the repository fast-forward. Every other repair queues with
-  the precondition that blocked it: `needs-grant` for a staged deployment or a
-  privileged verb, and `needs-operator` for a dirty checkout, a detached head, an
-  unpushed commit, a failed unit, or low disk.
+- REQUIREMENT (operator, 2026-11-16): pushes are mandatory. This supersedes the
+  earlier in-repo rule that lares never pushes. A local-only commit is not
+  backed up, so every clean checkout now syncs to `backup/<host>/<repo>`. The
+  safety rules the old refusal protected are unchanged: lares never forces,
+  never rewrites history, never deletes an unmerged branch, never pushes to a
+  remote's default branch, never pushes tags, notes, or refs outside the backup
+  namespace, and reads no secret.
+- Push failures are classified. A protected branch, a diverged remote, and an
+  auth failure queue as `needs-operator` and are not retried blind. A network
+  fault retries with backoff. An unpushed backup that survives three passes is
+  `escalated` and outranks the rest of the punch list.
+- The safe set is the repository fast-forward and the outbound push. Every other
+  repair queues with the precondition that blocked it: `needs-grant` for a
+  staged deployment or a privileged verb, and `needs-operator` for a dirty
+  checkout, a detached head, an unpushed commit, a failed unit, or low disk.
 - `audit_command` is optional. An empty value measures the host in-process; a
   non-empty value runs the external probe and queues every record it prints,
   because lares did not produce the repair.
