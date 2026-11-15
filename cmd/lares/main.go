@@ -16,6 +16,7 @@ import (
 	"flag"
 	"fmt"
 	"os"
+	"os/exec"
 	"path/filepath"
 	"strings"
 	"time"
@@ -41,9 +42,10 @@ Usage:
 
 Commands:
   measure [--json]           measure once, print records, append verdicts
-  pass                       one reconcile pass
+  pass                       one reconcile pass, including the reboot gate
   status [--json]            queue, holds, and the newest verdict per item
-  hold add <reason>          write a hold owned by pid-<pid>
+  hold add [--pid N] <reason>  write a hold for pid N, or for this process
+  hold exec -- <command...>  hold while a command runs, then release it
   hold list                  list holds, marking stale ones
   hold rm <owner>            remove a hold
   defer <id> <duration>      keep an item out of the queue for a while
@@ -142,6 +144,9 @@ func (a *app) load() error {
 	a.cfg = cfg
 
 	if a.repoDir == "" {
+		a.repoDir = cfg.RepoDir
+	}
+	if a.repoDir == "" {
 		wd, err := os.Getwd()
 		if err != nil {
 			return fmt.Errorf("read working directory: %w", err)
@@ -213,22 +218,28 @@ func (a *app) measure(ctx context.Context, args []string) {
 	ctx, cancel := context.WithTimeout(ctx, 5*time.Minute)
 	defer cancel()
 
-	records, err := contract.MeasureIn(ctx, a.repoDir, a.probe())
+	var records []contract.Record
+	err := a.withLock(func() error {
+		var err error
+		records, err = contract.MeasureIn(ctx, a.repoDir, a.probe())
+		if err != nil {
+			return err
+		}
+		now := time.Now()
+		for _, rec := range records {
+			if rec.IsSummary() {
+				continue
+			}
+			verdict := state.Verdict{ID: rec.ID, State: string(rec.State), Detail: rec.Detail, Fix: rec.Fix, At: now}
+			if err := a.store.AppendVerdict(verdict); err != nil {
+				return err
+			}
+		}
+		return nil
+	})
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "measure: %v\n", err)
 		os.Exit(3)
-	}
-
-	now := time.Now()
-	for _, rec := range records {
-		if rec.IsSummary() {
-			continue
-		}
-		verdict := state.Verdict{ID: rec.ID, State: string(rec.State), Detail: rec.Detail, Fix: rec.Fix, At: now}
-		if err := a.store.AppendVerdict(verdict); err != nil {
-			fmt.Fprintf(os.Stderr, "measure: %v\n", err)
-			os.Exit(3)
-		}
 	}
 
 	if *asJSON {
@@ -249,6 +260,25 @@ func (a *app) measure(ctx context.Context, args []string) {
 	if anyFinding(records) {
 		os.Exit(1)
 	}
+}
+
+// printReboot reports the reboot gate's verdict when a pass evaluated it.
+func printReboot(verdict reconcile.RebootVerdict) {
+	if verdict.Term == "" && !verdict.Allowed {
+		return // the gate did not run
+	}
+	if verdict.Allowed {
+		fmt.Println("reboot: activated")
+		return
+	}
+	fmt.Printf("reboot: blocked on %s", verdict.Term)
+	if verdict.HoldAge > 0 {
+		fmt.Printf(" (oldest hold %s)", verdict.HoldAge.Round(time.Minute))
+	}
+	if len(verdict.Unclaimed) > 0 {
+		fmt.Printf(" unclaimed=%s", strings.Join(verdict.Unclaimed, ","))
+	}
+	fmt.Println()
 }
 
 // anyFinding reports whether a non-summary record is not-live or stale.
@@ -278,6 +308,7 @@ func (a *app) pass(ctx context.Context) {
 	}
 	fmt.Printf("converged=%d queued=%d escalated=%d waiting=%d\n",
 		len(result.Converged), len(result.Queued), len(result.Escalated), len(result.Skipped))
+	printReboot(result.Reboot)
 	if anyFinding(result.Measured) {
 		os.Exit(1)
 	}
@@ -334,11 +365,15 @@ func (a *app) status(args []string) {
 	}
 }
 
-// hold handles `hold add`, `hold list`, and `hold rm`.
+// hold handles `hold add`, `hold exec`, `hold list`, and `hold rm`.
 func (a *app) hold(args []string) {
 	if len(args) == 0 {
-		fmt.Fprintln(os.Stderr, "hold: expected add, list, or rm")
+		fmt.Fprintln(os.Stderr, "hold: expected add, exec, list, or rm")
 		os.Exit(2)
+	}
+	if args[0] == "exec" {
+		a.holdExec(args[1:])
+		return
 	}
 	if err := a.load(); err != nil {
 		fmt.Fprintf(os.Stderr, "hold: %v\n", err)
@@ -346,22 +381,7 @@ func (a *app) hold(args []string) {
 	}
 	switch args[0] {
 	case "add":
-		reason := strings.TrimSpace(strings.Join(args[1:], " "))
-		if reason == "" {
-			fmt.Fprintln(os.Stderr, "hold add: expected a reason")
-			os.Exit(2)
-		}
-		hold := state.Hold{
-			Owner:  fmt.Sprintf("pid-%d", os.Getpid()),
-			Reason: reason,
-			PID:    os.Getpid(),
-			Start:  time.Now(),
-		}
-		if err := a.store.AddHold(hold); err != nil {
-			fmt.Fprintf(os.Stderr, "hold add: %v\n", err)
-			os.Exit(3)
-		}
-		fmt.Printf("hold %s: %s\n", hold.Owner, hold.Reason)
+		a.holdAdd(args[1:])
 	case "list":
 		holds, err := a.store.HoldsIncludingStale()
 		if err != nil {
@@ -380,7 +400,8 @@ func (a *app) hold(args []string) {
 			fmt.Fprintln(os.Stderr, "hold rm: expected an owner")
 			os.Exit(2)
 		}
-		if err := a.store.RemoveHold(args[1]); err != nil {
+		owner := args[1]
+		if err := a.withLock(func() error { return a.store.RemoveHold(owner) }); err != nil {
 			fmt.Fprintf(os.Stderr, "hold rm: %v\n", err)
 			os.Exit(3)
 		}
@@ -388,6 +409,102 @@ func (a *app) hold(args []string) {
 		fmt.Fprintf(os.Stderr, "hold: unknown action %q\n", args[0])
 		os.Exit(2)
 	}
+}
+
+// holdAdd writes a hold for the pid named by --pid, or for this process.
+func (a *app) holdAdd(args []string) {
+	fset := flag.NewFlagSet("hold add", flag.ExitOnError)
+	pid := fset.Int("pid", 0, "pid to hold, default this process")
+	if err := fset.Parse(args); err != nil {
+		os.Exit(2)
+	}
+	reason := strings.TrimSpace(strings.Join(fset.Args(), " "))
+	if reason == "" {
+		fmt.Fprintln(os.Stderr, "hold add: expected a reason")
+		os.Exit(2)
+	}
+	if *pid == 0 {
+		*pid = os.Getpid()
+	}
+	if !state.ProcessAlive(*pid) {
+		fmt.Fprintf(os.Stderr, "hold add: pid %d is not running\n", *pid)
+		os.Exit(2)
+	}
+	ticks, ok := state.ProcessStartTicks(*pid)
+	if !ok {
+		// Without a start time the hold still names the pid. Report it, because
+		// a reused pid could hold the host longer than intended.
+		fmt.Fprintf(os.Stderr, "hold add: cannot read the start time of pid %d, holding by pid only\n", *pid)
+	}
+	hold := state.Hold{
+		Owner:      fmt.Sprintf("pid-%d", *pid),
+		Reason:     reason,
+		PID:        *pid,
+		StartTicks: ticks,
+		Start:      time.Now(),
+	}
+	if err := a.withLock(func() error { return a.store.AddHold(hold) }); err != nil {
+		fmt.Fprintf(os.Stderr, "hold add: %v\n", err)
+		os.Exit(3)
+	}
+	fmt.Printf("hold %s: %s\n", hold.Owner, hold.Reason)
+}
+
+// holdExec runs a command under a hold that names the command's pid.
+//
+// The hold names the child rather than lares, so a lares crash still leaves the
+// running command protected. The hold is removed when the command exits.
+func (a *app) holdExec(args []string) {
+	if len(args) > 0 && args[0] == "--" {
+		args = args[1:]
+	}
+	if len(args) == 0 {
+		fmt.Fprintln(os.Stderr, "hold exec: expected -- <command...>")
+		os.Exit(2)
+	}
+	if err := a.load(); err != nil {
+		fmt.Fprintf(os.Stderr, "hold exec: %v\n", err)
+		os.Exit(3)
+	}
+
+	cmd := exec.Command(args[0], args[1:]...)
+	cmd.Stdin, cmd.Stdout, cmd.Stderr = os.Stdin, os.Stdout, os.Stderr
+	if err := cmd.Start(); err != nil {
+		fmt.Fprintf(os.Stderr, "hold exec: %v\n", err)
+		os.Exit(3)
+	}
+	owner := fmt.Sprintf("pid-%d", cmd.Process.Pid)
+	ticks, _ := state.ProcessStartTicks(cmd.Process.Pid)
+	hold := state.Hold{Owner: owner, Reason: strings.Join(args, " "), PID: cmd.Process.Pid, StartTicks: ticks, Start: time.Now()}
+	if err := a.withLock(func() error { return a.store.AddHold(hold) }); err != nil {
+		// A hold that could not be written must not leave the command running
+		// unprotected while the operator believes it is held.
+		_ = cmd.Process.Kill()
+		_, _ = cmd.Process.Wait()
+		fmt.Fprintf(os.Stderr, "hold exec: %v\n", err)
+		os.Exit(3)
+	}
+	err := cmd.Wait()
+	if removeErr := a.withLock(func() error { return a.store.RemoveHold(owner) }); removeErr != nil {
+		fmt.Fprintf(os.Stderr, "hold exec: release hold: %v\n", removeErr)
+	}
+	if err != nil {
+		var exit *exec.ExitError
+		if errors.As(err, &exit) {
+			os.Exit(exit.ExitCode())
+		}
+		fmt.Fprintf(os.Stderr, "hold exec: %v\n", err)
+		os.Exit(3)
+	}
+}
+
+// withLock runs fn under the state lock, so it never interleaves with a pass.
+func (a *app) withLock(fn func() error) error {
+	if err := a.store.Lock(); err != nil {
+		return err
+	}
+	defer a.store.Unlock()
+	return fn()
 }
 
 // deferItem moves an item's next attempt out by a duration.
@@ -401,40 +518,18 @@ func (a *app) deferItem(args []string) {
 		fmt.Fprintf(os.Stderr, "defer: %q is not a duration of at least 1m\n", args[1])
 		os.Exit(2)
 	}
-	if err := a.load(); err != nil {
+	engine, err := a.engine()
+	if err != nil {
 		fmt.Fprintf(os.Stderr, "defer: %v\n", err)
 		os.Exit(3)
 	}
-
 	id := args[0]
-	queue, _, err := a.store.Queue()
-	if err != nil && !errors.Is(err, state.ErrNoQueue) {
+	until, err := engine.Defer(id, d, "deferred from the CLI")
+	if err != nil {
 		fmt.Fprintf(os.Stderr, "defer: %v\n", err)
 		os.Exit(3)
 	}
-	now := time.Now()
-	found := false
-	for i, item := range queue.Items {
-		if item.ID != id {
-			continue
-		}
-		queue.Items[i].NextAttemptAt = now.Add(d)
-		queue.Items[i].Term = "deferred"
-		found = true
-	}
-	if !found {
-		queue.Items = append(queue.Items, state.Item{
-			ID:            id,
-			Term:          "deferred",
-			FirstSeen:     now,
-			NextAttemptAt: now.Add(d),
-		})
-	}
-	if _, err := a.store.SaveQueue(queue); err != nil {
-		fmt.Fprintf(os.Stderr, "defer: %v\n", err)
-		os.Exit(3)
-	}
-	fmt.Printf("deferred %s until %s\n", id, now.Add(d).Format(time.RFC3339))
+	fmt.Printf("deferred %s until %s\n", id, until.Format(time.RFC3339))
 }
 
 // reboot evaluates the gate, and activates a reboot unless --dry-run.
@@ -499,10 +594,12 @@ func (a *app) install(args []string) {
 		fmt.Fprintf(os.Stderr, "install: %v\n", err)
 		os.Exit(3)
 	}
+	cfg := a.cfg
+	cfg.RepoDir = a.repoDir
 	written, err := install.Install(install.Options{
 		HomeDir:    home,
 		BinaryPath: self,
-		Config:     a.cfg,
+		Config:     cfg,
 		Adapters:   a.table,
 	})
 	if err != nil {
@@ -512,8 +609,8 @@ func (a *app) install(args []string) {
 	for _, path := range written {
 		fmt.Println(path)
 	}
-	fmt.Println("\nRun these once, by hand:")
-	for _, step := range install.NextSteps(home) {
+	fmt.Println("\nRun this once, by hand. lares never enables linger itself:")
+	for _, step := range install.NextSteps() {
 		fmt.Printf("  %s\n", step)
 	}
 	fmt.Println("\nThen enable the timer:")

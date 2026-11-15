@@ -1,9 +1,10 @@
 // Package config loads lares' top-level configuration.
 //
-// The file names the probe command, the state and config directories, an
-// optional adapter override, the resync interval, and the local-clock window in
-// which a disruptive repair or a reboot may run. There is no host name and no
-// machine-specific path in the defaults.
+// The file names the probe command, the checkout that holds it, the state and
+// config directories, an optional adapter override, the resync interval, and
+// the local-clock window in which a disruptive repair or a reboot may run. A
+// pass evaluates the reboot gate unless reboot_from_pass is false. There is no
+// host name and no machine-specific path in the defaults.
 //
 // Load and Validate both leave Resync and Window set and parsed, so a caller
 // never reads ResyncText, WindowStart, or WindowEnd. Validate has a pointer
@@ -38,10 +39,12 @@ type Config struct {
 	AuditCommand    []string      `toml:"audit_command"`
 	StateDir        string        `toml:"state_dir"`
 	ConfigDir       string        `toml:"config_dir"`
+	RepoDir         string        `toml:"repo_dir"`
 	AdapterOverride string        `toml:"adapter_override"`
 	WindowStart     string        `toml:"window_start"`
 	WindowEnd       string        `toml:"window_end"`
 	ResyncText      string        `toml:"resync"`
+	RebootFromPass  bool          `toml:"reboot_from_pass"`
 	Resync          time.Duration `toml:"-"`
 	Window          Window        `toml:"-"`
 }
@@ -49,16 +52,17 @@ type Config struct {
 // Default returns the configuration used when no file exists.
 //
 // The probe is ["bash", "install/lib/hygiene-audit.sh"], the resync interval is
-// 15 minutes, and the window is 02:00-05:00. StateDir and ConfigDir are empty
-// until Load fills them from the XDG defaults.
+// 15 minutes, the window is 02:00-05:00, and a pass evaluates the reboot gate.
+// StateDir and ConfigDir are empty until Load fills them from the XDG defaults.
 func Default() Config {
 	return Config{
-		AuditCommand: []string{"bash", "install/lib/hygiene-audit.sh"},
-		ResyncText:   "15m",
-		Resync:       15 * time.Minute,
-		WindowStart:  "02:00",
-		WindowEnd:    "05:00",
-		Window:       Window{Start: "02:00", End: "05:00"},
+		AuditCommand:   []string{"bash", "install/lib/hygiene-audit.sh"},
+		ResyncText:     "15m",
+		Resync:         15 * time.Minute,
+		WindowStart:    "02:00",
+		WindowEnd:      "05:00",
+		Window:         Window{Start: "02:00", End: "05:00"},
+		RebootFromPass: true,
 	}
 }
 

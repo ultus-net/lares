@@ -35,6 +35,7 @@ type Family string
 const (
 	Arch         Family = "arch"
 	FedoraAtomic Family = "fedora-atomic"
+	Bootc        Family = "bootc"
 	Unknown      Family = "unknown"
 )
 
@@ -49,13 +50,39 @@ type Adapter struct {
 	Stamp    string   // optional file that records the staged version
 }
 
+// Defaults returns the adapters a fresh install ships, one per known family.
+//
+// The verbs are argv arrays, never shell strings, and the Arch stage is the
+// repository's own wrapper rather than pacman or omarchy-update.
+func Defaults() map[Family]Adapter {
+	return map[Family]Adapter{
+		Arch: {
+			Family:   Arch,
+			Stage:    []string{"patch-train-update"},
+			Activate: []string{"omarchy-system", "reboot"},
+			Stamp:    "/var/lib/patch-train/version-stamp",
+		},
+		FedoraAtomic: {
+			Family:   FedoraAtomic,
+			Stage:    []string{"rpm-ostree", "upgrade"},
+			Activate: []string{"systemctl", "reboot"},
+		},
+		Bootc: {
+			Family:   Bootc,
+			Stage:    []string{"bootc", "upgrade"},
+			Activate: []string{"systemctl", "reboot"},
+		},
+	}
+}
+
 // Detect classifies os-release bytes.
 //
 // ID and ID_LIKE values may be quoted, and ID_LIKE is space-separated. A host
-// whose ID or ID_LIKE names arch is Arch. A host that names fedora is
-// FedoraAtomic when rpm-ostree is present. Everything else, including input
-// that does not parse, is Unknown with no error.
-func Detect(osRelease []byte, hasRpmOstree bool) (Family, error) {
+// whose ID or ID_LIKE names arch is Arch. A host that names fedora is Bootc when
+// bootc is present, FedoraAtomic when rpm-ostree is present, and Unknown
+// otherwise. Everything else, including input that does not parse, is Unknown
+// with no error.
+func Detect(osRelease []byte, hasRpmOstree, hasBootc bool) (Family, error) {
 	fields := parseOSRelease(osRelease)
 	ids := append([]string{fields["id"]}, strings.Fields(fields["id_like"])...)
 	for _, id := range ids {
@@ -63,11 +90,15 @@ func Detect(osRelease []byte, hasRpmOstree bool) (Family, error) {
 			return Arch, nil
 		}
 	}
-	if hasRpmOstree {
-		for _, id := range ids {
-			if id == "fedora" {
-				return FedoraAtomic, nil
-			}
+	for _, id := range ids {
+		if id != "fedora" {
+			continue
+		}
+		if hasBootc {
+			return Bootc, nil
+		}
+		if hasRpmOstree {
+			return FedoraAtomic, nil
 		}
 	}
 	return Unknown, nil
@@ -108,8 +139,9 @@ func DetectHost() (Family, error) {
 	if err != nil {
 		return Unknown, fmt.Errorf("read /etc/os-release: %w", err)
 	}
-	_, lookErr := exec.LookPath("rpm-ostree")
-	return Detect(data, lookErr == nil)
+	_, ostreeErr := exec.LookPath("rpm-ostree")
+	_, bootcErr := exec.LookPath("bootc")
+	return Detect(data, ostreeErr == nil, bootcErr == nil)
 }
 
 // Load reads adapters.toml into a table keyed by family.

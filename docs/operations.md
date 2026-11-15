@@ -8,31 +8,45 @@ README is the overview; this page is the reference.
 `lares pass` is the whole loop, and `lares.timer` runs it on the resync
 interval.
 
-1. Run the probe (`hygiene-audit.sh --json`) and append one verdict per record.
-2. Rebuild the queue from the findings.
-3. For each finding in the safe set that is due, run its repair verb.
-4. Re-measure after 5 seconds, 30 seconds, and 5 minutes. A finding that clears
-   is converged. Three unchanged measurements escalate with the run log path.
-5. Save the queue with a new generation.
+1. Take `lock`, so a second lares process exits instead of working the same
+   items. `pass`, `reboot`, and every hold change share that lock.
+2. Run the probe (`hygiene-audit.sh --json`) and append one verdict per record.
+3. Rebuild the queue from the findings, replaying any deferral from the log.
+4. For each finding in the safe set that is due, run its repair verb.
+5. Re-measure after 5 seconds, 30 seconds, and 5 minutes. The repair converged
+   only when a verification names the item and says `live`. A missing record and
+   an `unknown` record both leave the item queued.
+6. Save the queue, then evaluate the reboot gate when `reboot_from_pass` is on.
 
 A finding the safe set does not cover is queued and never attempted. The queue
 is derived state: an item that stops being a finding leaves the queue, and its
-attempt count resets. A judgement the operator made, such as a deferral, is
-stored in the item's `NextAttemptAt`, so a rebuilt queue keeps it.
+attempt count resets. A deferral is written to `verdicts.jsonl` as well, so a
+rebuilt queue keeps the operator's judgement.
 
 ## The safe set
 
 | Item | Verb |
 | --- | --- |
-| `hermes` | `install/host-setup.sh --only hermes --apply` |
-| `maintenance` | `install/host-setup.sh --only maintenance --apply` |
-| `notebook` | `install/host-setup.sh --only notebook --apply` |
-| `profile` | `install/host-setup.sh --only profile --apply` |
+| `profile` | `install/profile-select.sh <profile>` |
 
-Everything else queues. `patch-train` is excluded because its timer needs a
-widened sudo grant before it can succeed. `offsite` needs a provider decision,
-`backup` needs a mount and a password, and branch cleanup needs a per-branch
-judgement.
+Everything else queues, with the precondition that blocked it:
+
+| Term | Meaning |
+| --- | --- |
+| `needs-tty` | the repair calls `as_root`, which opens `/dev/tty` for sudo |
+| `needs-grant` | the repair needs a privilege the host has not granted |
+| `needs-operator` | the repair writes to a remote or needs a judgement call |
+| `unverified` | the probe returned `unknown`, so no repair is safe |
+| `hold` | a live hold is blocking disruptive work |
+| `scan` | `/proc` could not be read, so an unclaimed agent cannot be ruled out |
+| `fix-did-not-hold` | the repair ran and verification saw no movement |
+| `backoff` | the item is due, but its retry delay has not elapsed |
+| `deferred` | the operator moved it out |
+
+`maintenance` and `hermes` need a TTY. `patch-train` needs a sudo grant.
+`notebook` creates and pushes a GitHub repository, so it is never unattended.
+`offsite` needs a provider decision, `backup` needs a mount and a password, and
+branch cleanup needs a per-branch judgement.
 
 ## Backoff
 
@@ -42,16 +56,25 @@ work costs one attempt per day, not one per resync.
 
 ## Holds
 
-A hold is a file `holds/<owner>.json` with an owner, a reason, a pid, and a
-start time. Any long-horizon task writes one:
+A hold is a file `holds/<owner>.json` with an owner, a reason, a pid, the
+process start time, and a wall-clock start. Any long-horizon task writes one:
 
 ```bash
 lares hold add "agent run: ticket 214"
+lares hold add --pid 4242 "import running outside lares"
+lares hold exec -- ./long-build.sh
 ```
 
-The owner is `pid-<pid>` for `hold add`. A hold is stale when its pid is gone.
-A stale hold is ignored, reported, and removed, so a crashed tool cannot pin the
-host. A hold whose file does not parse is stale too.
+`hold exec` starts the command, writes a hold that names the command's pid, and
+removes it when the command exits. The hold names the child rather than lares,
+so a lares crash leaves the running command protected.
+
+The owner is `pid-<pid>`, and a non-slug owner is rejected rather than
+rewritten, so two identities never share one file. A hold is stale when its pid
+is gone, or when `/proc/<pid>/stat` reports a different start time, which means
+the pid was reused. A stale hold is ignored, reported, and removed, so a crashed
+tool cannot pin the host. A permission error means the process exists under
+another user, so it keeps the hold.
 
 `lares hold list` marks stale holds. `lares hold rm <owner>` removes one.
 
@@ -66,8 +89,9 @@ instead of rebooting over it.
 lares defer offsite 24h
 ```
 
-The item stays in the queue with `next_attempt_at` moved out. A deferral is
-never silently dropped by a rebuild.
+The item stays in the queue with `next_attempt_at` moved out, and the deferral
+is appended to `verdicts.jsonl` as a `defer` record. A rebuild replays it, so a
+lost queue keeps the operator's judgement. The shortest deferral is one minute.
 
 ## Rebooting
 
@@ -75,20 +99,31 @@ never silently dropped by a rebuild.
 can_reboot = window_open AND no_hold AND no_interactive_session AND no_own_job
 ```
 
-| Term | False when |
+| Term | Blocks when |
 | --- | --- |
 | `window` | the local clock is outside `window_start`-`window_end` |
-| `hold` | any live hold exists |
+| `hold` | any live hold exists, or a live `opencode`/`orca` process has none |
+| `scan` | `/proc` could not be read, so no agent could be ruled out |
 | `session` | a session other than the user's manager is logged in, Omarchy's stay-awake marker exists, or `loginctl` cannot answer |
-| `own-job` | a pass is running, or Omarchy's update lock is held |
+| `own-job` | an update transaction is running, or its state cannot be read |
 
 The term order is the evaluation order, so the queue names the first blocker.
 A blocked reboot is a queue item with that term, and it waits: nothing prompts,
-because a question at 03:00 is a hung timer.
+because a question at 03:00 is a hung timer. The verdict fails closed: an
+unreadable session state or train state blocks instead of guessing.
+
+The train check is per family. Arch asks `omarchy-update-lock held`. Fedora
+atomic and bootc look for a running `rpm-ostree` or `bootc` process. A family
+with no check at all is an error, so it blocks rather than claiming the train is
+idle.
+
+`pass` evaluates the gate last, while it still holds `lock`, unless
+`reboot_from_pass` is false. `lares reboot` evaluates and acts in one lock hold,
+so no repair can start between the check and the activation.
+`lares reboot --dry-run` prints the verdict without acting.
 
 Activation comes from `adapters.toml`, so Arch uses `omarchy-system reboot`
-(closes windows first) and Fedora atomic reboots plainly. `lares reboot
---dry-run` prints the verdict without acting.
+(closes windows first) and Fedora atomic or bootc reboots plainly.
 
 ## State
 
@@ -98,8 +133,13 @@ Activation comes from `adapters.toml`, so Arch uses `omarchy-system reboot`
 ├── queue.json            the queue
 ├── queue.json.bak        the previous generation
 ├── holds/                one file per live hold
-└── runs/                 one log per item per UTC day, 30 day retention, 10 MiB cap
+├── runs/                 one log per item per UTC day, 30 day retention, 10 MiB cap
+└── lock                  the interprocess lock, flock on a file
 ```
+
+`lock` is not reentrant. A second process gets an error instead of waiting, so a
+timer pass never queues behind a stuck one. A pass, a reboot, a measure, and a
+hold or deferral write each take it.
 
 `queue.json` is replaced, never edited: temp file, fsync, backup, rename,
 directory fsync. A reader that finds a corrupt primary renames it to
@@ -114,17 +154,18 @@ lares install --user
 
 Writes the binary, `lares.service`, `lares.timer`, `config.toml`, and
 `adapters.toml`. An existing config or adapter file is left alone; the binary
-and the units are replaced.
+and the units are replaced. The service unit gets `WorkingDirectory=<repo_dir>`,
+so the timer finds the probe in the checkout it was installed from.
 
-It prints two commands and does not run them:
+It prints one command and does not run it:
 
 ```bash
-sudo install -m 0440 lares.sudoers /etc/sudoers.d/lares
 loginctl enable-linger "$USER"
 ```
 
-A tool that grants itself passwordless sudo is a privilege-escalation path.
-This one prints the exact commands instead.
+The installer writes no sudoers file. A tool that grants itself passwordless
+sudo is a privilege-escalation path, and lares never asks for a standing grant:
+a repair that needs root stays queued as `needs-grant`.
 
 ## Adapters
 
@@ -139,10 +180,19 @@ stamp = "/var/lib/patch-train/version-stamp"
 [fedora-atomic]
 stage = ["rpm-ostree", "upgrade"]
 activate = ["systemctl", "reboot"]
+
+[bootc]
+stage = ["bootc", "upgrade"]
+activate = ["systemctl", "reboot"]
 ```
 
-`config.toml`'s `adapter_override` names a section when detection is wrong. An
-unrecognised host measures and never acts.
+Detection order is Arch first, then Fedora with `bootc` present, then Fedora with
+`rpm-ostree` present. A host that names neither measures and never acts.
+
+`config.toml`'s `adapter_override` names a section when detection is wrong.
+`repo_dir` is the checkout that holds the probe. `reboot_from_pass` (default
+true) decides whether a pass evaluates the reboot gate, and it exists so a host
+that reboots by hand can turn the gate off without editing the binary.
 
 ## Troubleshooting
 

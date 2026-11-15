@@ -6,8 +6,8 @@
 // a new check arrives as data.
 //
 // Every side effect is injectable: measure, run a command, sleep, read the
-// session state, ask the update-train lock, and activate a reboot. Tests drive
-// the whole loop without touching the host.
+// session state, ask the update-train lock, list agent processes, and activate a
+// reboot. Tests drive the whole loop without touching the host.
 package reconcile
 
 import (
@@ -17,7 +17,6 @@ import (
 	"os/exec"
 	"path/filepath"
 	"strings"
-	"sync/atomic"
 	"time"
 
 	"github.com/ultus-net/lares/internal/adapter"
@@ -32,14 +31,13 @@ var VerifyDelays = []time.Duration{5 * time.Second, 30 * time.Second, 5 * time.M
 // maxBackoff caps the queue delay.
 const maxBackoff = 24 * time.Hour
 
-// termNeedsOperator marks a finding the safe set does not cover.
-const termNeedsOperator = "needs-operator"
-
-// termDidNotHold marks a repair whose verification saw no movement.
-const termDidNotHold = "fix-did-not-hold"
-
-// termBackoff marks a due item that is waiting out its retry delay.
-const termBackoff = "backoff"
+// Agent is one long-horizon process. StartTicks pins the process instance, so a
+// hold claims one process and never every process with the same name.
+type Agent struct {
+	PID        int
+	Name       string
+	StartTicks uint64
+}
 
 // Options are the dependencies of an Engine. New fills the zero values with the
 // host defaults.
@@ -59,7 +57,7 @@ type Options struct {
 	Sleep    func(ctx context.Context, d time.Duration) error
 	Session  func(ctx context.Context) (bool, error)
 	Train    func(ctx context.Context) (bool, error)
-	Agents   func() []string
+	Agents   func() ([]Agent, error)
 	Activate func(ctx context.Context, argv []string) error
 }
 
@@ -77,10 +75,8 @@ type Engine struct {
 	sleep    func(ctx context.Context, d time.Duration) error
 	session  func(ctx context.Context) (bool, error)
 	train    func(ctx context.Context) (bool, error)
-	agents   func() []string
+	agents   func() ([]Agent, error)
 	activate func(ctx context.Context, argv []string) error
-
-	busy atomic.Bool
 }
 
 // Result reports what one pass did.
@@ -90,6 +86,7 @@ type Result struct {
 	Queued    []string
 	Escalated []string
 	Skipped   []string
+	Reboot    RebootVerdict
 }
 
 // New builds an Engine, replacing the zero fields in opts with host defaults.
@@ -184,12 +181,15 @@ func sleepContext(ctx context.Context, d time.Duration) error {
 }
 
 // Pass measures once, converges what is due and safe, verifies, queues the
-// rest, and records a verdict per record.
+// rest, records a verdict per record, and evaluates the reboot gate.
+//
+// The whole pass runs under the state lock, so a second lares process cannot
+// repair the same item or overwrite the queue this pass derived.
 func (e *Engine) Pass(ctx context.Context) (Result, error) {
-	if !e.busy.CompareAndSwap(false, true) {
-		return Result{}, errors.New("reconcile: a pass is already running")
+	if err := e.store.Lock(); err != nil {
+		return Result{}, err
 	}
-	defer e.busy.Store(false)
+	defer e.store.Unlock()
 
 	now := e.now()
 	records, err := e.measure(ctx)
@@ -197,14 +197,8 @@ func (e *Engine) Pass(ctx context.Context) (Result, error) {
 		return Result{}, fmt.Errorf("measure: %w", err)
 	}
 	result := Result{Measured: records}
-	for _, rec := range records {
-		if rec.IsSummary() {
-			continue
-		}
-		verdict := state.Verdict{ID: rec.ID, State: string(rec.State), Detail: rec.Detail, Fix: rec.Fix, At: now}
-		if err := e.store.AppendVerdict(verdict); err != nil {
-			return result, err
-		}
+	if err := e.record(records, now); err != nil {
+		return result, err
 	}
 	if err := e.store.Prune(now); err != nil {
 		return result, err
@@ -218,21 +212,62 @@ func (e *Engine) Pass(ctx context.Context) (Result, error) {
 	for _, item := range previous.Items {
 		previousByID[item.ID] = item
 	}
+	deferrals, err := e.store.Deferrals()
+	if err != nil {
+		return result, err
+	}
+	holds, err := e.store.Holds()
+	if err != nil {
+		return result, err
+	}
+	// A failed process scan cannot prove that no agent is running, so it holds
+	// the work just as a live hold does, under its own term.
+	unclaimed, scanErr := e.unclaimedAgents(holds)
+	heldTerm := termHold
+	if scanErr != nil {
+		heldTerm = termScan
+	}
+	held := len(holds) > 0 || scanErr != nil || len(unclaimed) > 0
 
 	next := state.Queue{Generation: previous.Generation}
+	// A queued reboot survives the pass; the gate below rewrites its term or
+	// clears it once it runs.
+	if item, ok := previousByID[RebootID]; ok {
+		next.Items = append(next.Items, item)
+	}
+
 	for _, rec := range records {
-		if rec.IsSummary() || !rec.IsFinding() {
+		if rec.IsSummary() || !rec.NeedsAttention() {
 			continue
 		}
 		item, seen := previousByID[rec.ID]
 		if !seen {
 			item = state.Item{ID: rec.ID, FirstSeen: now}
 		}
-		item.Term = termNeedsOperator
 
-		if !safeToConverge(rec.ID) || rec.Fix == "" {
+		if deferral, ok := deferrals[rec.ID]; ok && deferral.Until.After(now) {
+			item.Term = termDeferred
+			item.NextAttemptAt = deferral.Until
+			next.Items = append(next.Items, item)
+			result.Skipped = append(result.Skipped, rec.ID)
+			continue
+		}
+		if rec.State == contract.Unknown {
+			item.Term = termUnverified
 			next.Items = append(next.Items, item)
 			result.Queued = append(result.Queued, rec.ID)
+			continue
+		}
+		if !safeToConverge(rec.ID) || rec.Fix == "" {
+			item.Term = repairTerm(rec.ID)
+			next.Items = append(next.Items, item)
+			result.Queued = append(result.Queued, rec.ID)
+			continue
+		}
+		if held {
+			item.Term = heldTerm
+			next.Items = append(next.Items, item)
+			result.Skipped = append(result.Skipped, rec.ID)
 			continue
 		}
 		if item.NextAttemptAt.After(now) {
@@ -256,16 +291,30 @@ func (e *Engine) Pass(ctx context.Context) (Result, error) {
 		item.LastRunLog = logPath
 		next.Items = append(next.Items, item)
 		result.Escalated = append(result.Escalated, rec.ID)
+		// Keep the attempt even if the pass hits its deadline later.
+		if err := e.persistItem(item); err != nil {
+			return result, err
+		}
 	}
 
 	if _, err := e.store.SaveQueue(next); err != nil {
 		return result, err
 	}
+	if e.cfg.RebootFromPass {
+		verdict, err := e.rebootLocked(ctx)
+		if err != nil {
+			return result, err
+		}
+		result.Reboot = verdict
+	}
 	return result, nil
 }
 
 // converge runs the record's repair verb, then re-measures on the verify ladder.
-// It returns whether the item stopped being a finding, plus the run log path.
+//
+// It returns true only when a verification measurement names the item and says
+// live. A missing record and an unknown record both leave the repair unproven,
+// so the item stays queued.
 func (e *Engine) converge(ctx context.Context, rec contract.Record) (bool, string, error) {
 	argv := strings.Fields(rec.Fix)
 	output, runErr := e.run(ctx, e.repoDir, argv)
@@ -286,11 +335,28 @@ func (e *Engine) converge(ctx context.Context, rec contract.Record) (bool, strin
 		if err != nil {
 			return false, logPath, fmt.Errorf("verify %s: %w", rec.ID, err)
 		}
-		if !stillFinding(records, rec.ID) {
+		if err := e.record(records, e.now()); err != nil {
+			return false, logPath, err
+		}
+		if st, ok := stateOf(records, rec.ID); ok && st == contract.Live {
 			return true, logPath, nil
 		}
 	}
 	return false, logPath, nil
+}
+
+// record appends one verdict per non-summary record.
+func (e *Engine) record(records []contract.Record, at time.Time) error {
+	for _, rec := range records {
+		if rec.IsSummary() {
+			continue
+		}
+		verdict := state.Verdict{ID: rec.ID, State: string(rec.State), Detail: rec.Detail, Fix: rec.Fix, At: at}
+		if err := e.store.AppendVerdict(verdict); err != nil {
+			return err
+		}
+	}
+	return nil
 }
 
 // formatRun renders one converge run for the item's log.
@@ -311,14 +377,36 @@ func formatRun(rec contract.Record, argv []string, output string, runErr error) 
 	return b.String()
 }
 
-// stillFinding reports whether id is still a finding in records.
-func stillFinding(records []contract.Record, id string) bool {
+// stateOf returns id's state and whether records named it.
+func stateOf(records []contract.Record, id string) (contract.State, bool) {
 	for _, rec := range records {
 		if rec.ID == id && !rec.IsSummary() {
-			return rec.IsFinding()
+			return rec.State, true
 		}
 	}
-	return false
+	return "", false
+}
+
+// persistItem writes one item immediately, so a pass that hits its deadline
+// still keeps the attempts and backoff it earned.
+func (e *Engine) persistItem(item state.Item) error {
+	queue, _, err := e.store.Queue()
+	if err != nil && !errors.Is(err, state.ErrNoQueue) {
+		return err
+	}
+	replaced := false
+	for i, existing := range queue.Items {
+		if existing.ID == item.ID {
+			queue.Items[i] = item
+			replaced = true
+			break
+		}
+	}
+	if !replaced {
+		queue.Items = append(queue.Items, item)
+	}
+	_, err = e.store.SaveQueue(queue)
+	return err
 }
 
 // backoff doubles the resync interval per attempt and caps at one day.
@@ -336,6 +424,58 @@ func backoff(resync time.Duration, attempts int) time.Duration {
 	return delay
 }
 
+// Defer records an operator deferral and moves the item's next attempt out.
+//
+// The deferral is appended to the verdict log before the queue changes, so a
+// lost queue is rebuilt with the operator's judgement intact.
+func (e *Engine) Defer(id string, d time.Duration, reason string) (time.Time, error) {
+	if !state.ValidSlug(id) {
+		return time.Time{}, fmt.Errorf("defer: %q is not an item id", id)
+	}
+	if d < time.Minute {
+		return time.Time{}, fmt.Errorf("defer: %v is shorter than a minute", d)
+	}
+	if err := e.store.Lock(); err != nil {
+		return time.Time{}, err
+	}
+	defer e.store.Unlock()
+
+	now := e.now()
+	until := now.Add(d)
+	if err := e.store.AppendVerdict(state.Verdict{
+		ID: id, Kind: state.KindDefer, Detail: reason, At: now, Until: until,
+	}); err != nil {
+		return time.Time{}, err
+	}
+
+	queue, _, err := e.store.Queue()
+	if err != nil && !errors.Is(err, state.ErrNoQueue) {
+		return time.Time{}, err
+	}
+	found := false
+	for i := range queue.Items {
+		if queue.Items[i].ID != id {
+			continue
+		}
+		queue.Items[i].Term = termDeferred
+		queue.Items[i].NextAttemptAt = until
+		found = true
+		break
+	}
+	if !found {
+		queue.Items = append(queue.Items, state.Item{
+			ID:            id,
+			Term:          termDeferred,
+			FirstSeen:     now,
+			NextAttemptAt: until,
+		})
+	}
+	if _, err := e.store.SaveQueue(queue); err != nil {
+		return time.Time{}, err
+	}
+	return until, nil
+}
+
 // Status is the queue, the live holds, and the newest verdict per item.
 type Status struct {
 	Queue    state.Queue
@@ -343,7 +483,8 @@ type Status struct {
 	Verdicts map[string]state.Verdict
 }
 
-// Status reads the current state for the CLI and the TUI.
+// Status reads the current state for the CLI and the TUI. A deferral is not a
+// measurement, so it never replaces the newest verdict.
 func (e *Engine) Status() (Status, error) {
 	queue, _, err := e.store.Queue()
 	if err != nil && !errors.Is(err, state.ErrNoQueue) {
@@ -359,6 +500,9 @@ func (e *Engine) Status() (Status, error) {
 	}
 	newest := make(map[string]state.Verdict, len(verdicts))
 	for _, v := range verdicts {
+		if v.IsDeferral() {
+			continue
+		}
 		newest[v.ID] = v
 	}
 	return Status{Queue: queue, Holds: holds, Verdicts: newest}, nil

@@ -19,6 +19,12 @@ func TestDefault(t *testing.T) {
 	if cfg.Window != (Window{Start: "02:00", End: "05:00"}) {
 		t.Errorf("window %+v", cfg.Window)
 	}
+	if !cfg.RebootFromPass {
+		t.Error("a pass must evaluate the reboot gate by default")
+	}
+	if cfg.RepoDir != "" {
+		t.Errorf("repo dir %q, want empty", cfg.RepoDir)
+	}
 	if cfg.StateDir != "" || cfg.ConfigDir != "" {
 		t.Errorf("dirs should be empty until Load: %q %q", cfg.StateDir, cfg.ConfigDir)
 	}
@@ -49,10 +55,12 @@ func TestLoadFile(t *testing.T) {
 audit_command = ["bash", "/opt/audit.sh"]
 state_dir = "/var/lib/lares"
 config_dir = "/etc/lares"
+repo_dir = "/home/tester/dotfiles"
 adapter_override = "arch"
 window_start = "23:30"
 window_end = "01:15"
 resync = "2h"
+reboot_from_pass = false
 `
 	if err := os.WriteFile(path, []byte(body), 0o600); err != nil {
 		t.Fatal(err)
@@ -63,6 +71,12 @@ resync = "2h"
 	}
 	if cfg.Resync != 2*time.Hour {
 		t.Errorf("resync %v", cfg.Resync)
+	}
+	if cfg.RepoDir != "/home/tester/dotfiles" {
+		t.Errorf("repo dir %q", cfg.RepoDir)
+	}
+	if cfg.RebootFromPass {
+		t.Error("reboot_from_pass = false was ignored")
 	}
 	if cfg.Window != (Window{Start: "23:30", End: "01:15"}) {
 		t.Errorf("window %+v", cfg.Window)

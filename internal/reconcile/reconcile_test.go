@@ -6,6 +6,7 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
@@ -35,6 +36,9 @@ type harness struct {
 
 // newHarness builds an engine whose probe returns the scripted measurements in
 // order, repeating the last one.
+//
+// The reboot gate is off by default so a pass test asserts the pass alone. A
+// test that wants the gate sets cfg.RebootFromPass and an adapter.
 func newHarness(t *testing.T, script ...[]contract.Record) *harness {
 	t.Helper()
 	dir := t.TempDir()
@@ -42,19 +46,10 @@ func newHarness(t *testing.T, script ...[]contract.Record) *harness {
 	if err != nil {
 		t.Fatalf("state.Open: %v", err)
 	}
-	cfg := config.Default()
-	cfg.StateDir = dir
-	cfg.ConfigDir = dir
-	cfg.WindowStart = "00:00"
-	cfg.WindowEnd = "23:59"
-	if err := cfg.Validate(); err != nil {
-		t.Fatalf("config.Validate: %v", err)
-	}
-
 	h := &harness{store: store, stateDir: dir, repoDir: dir, measures: script}
 	index := 0
 	engine, err := New(Options{
-		Config:  cfg,
+		Config:  testConfig(dir, false),
 		Store:   store,
 		Family:  adapter.Arch,
 		RepoDir: dir,
@@ -80,6 +75,7 @@ func newHarness(t *testing.T, script ...[]contract.Record) *harness {
 		},
 		Session: func(context.Context) (bool, error) { return h.session, nil },
 		Train:   func(context.Context) (bool, error) { return h.train, nil },
+		Agents:  func() ([]Agent, error) { return nil, nil },
 		Activate: func(_ context.Context, argv []string) error {
 			h.activations = append(h.activations, argv)
 			return nil
@@ -90,6 +86,44 @@ func newHarness(t *testing.T, script ...[]contract.Record) *harness {
 	}
 	h.engine = engine
 	return h
+}
+
+// testConfig builds a valid config over dir.
+func testConfig(dir string, rebootFromPass bool) config.Config {
+	cfg := config.Default()
+	cfg.StateDir = dir
+	cfg.ConfigDir = dir
+	cfg.WindowStart = "00:00"
+	cfg.WindowEnd = "23:59"
+	cfg.RebootFromPass = rebootFromPass
+	if err := cfg.Validate(); err != nil {
+		panic(err)
+	}
+	return cfg
+}
+
+// secondEngine opens a second engine over an existing state directory, which is
+// what a second lares process sees.
+func secondEngine(t *testing.T, dir string) *Engine {
+	t.Helper()
+	store, err := state.Open(dir)
+	if err != nil {
+		t.Fatalf("state.Open: %v", err)
+	}
+	engine, err := New(Options{
+		Config:  testConfig(dir, false),
+		Store:   store,
+		Family:  adapter.Arch,
+		RepoDir: dir,
+		Measure: func(context.Context) ([]contract.Record, error) {
+			return []contract.Record{summary(contract.Live)}, nil
+		},
+		Agents: func() ([]Agent, error) { return nil, nil },
+	})
+	if err != nil {
+		t.Fatalf("New: %v", err)
+	}
+	return engine
 }
 
 // rec builds a non-summary record.
@@ -127,31 +161,41 @@ func (h *harness) queued(t *testing.T) map[string]state.Item {
 	return items
 }
 
+// profileDrift is one safe finding, paired with its summary.
+func profileDrift() []contract.Record {
+	return []contract.Record{
+		rec("profile", contract.NotLive, "install/profile-select.sh laptop-omarchy"),
+		summary(contract.NotLive),
+	}
+}
+
+// profileLive is the same item after the repair landed.
+func profileLive() []contract.Record {
+	return []contract.Record{rec("profile", contract.Live, ""), summary(contract.Live)}
+}
+
 func TestPassConvergesSafeItem(t *testing.T) {
 	withVerifyDelays(t, time.Second)
-	h := newHarness(t,
-		[]contract.Record{rec("maintenance", contract.NotLive, "install/host-setup.sh --only maintenance --apply"), summary(contract.NotLive)},
-		[]contract.Record{rec("maintenance", contract.Live, ""), summary(contract.Live)},
-	)
+	h := newHarness(t, profileDrift(), profileLive())
 
 	result, err := h.engine.Pass(context.Background())
 	if err != nil {
 		t.Fatalf("Pass: %v", err)
 	}
-	if len(result.Converged) != 1 || result.Converged[0] != "maintenance" {
+	if len(result.Converged) != 1 || result.Converged[0] != "profile" {
 		t.Fatalf("converged %v", result.Converged)
 	}
 	if len(h.runs) != 1 {
 		t.Fatalf("ran %d commands, want 1", len(h.runs))
 	}
-	want := "install/host-setup.sh --only maintenance --apply"
+	want := "install/profile-select.sh laptop-omarchy"
 	if got := strings.Join(h.runs[0], " "); got != want {
 		t.Errorf("ran %q, want %q", got, want)
 	}
 	if items := h.queued(t); len(items) != 0 {
 		t.Errorf("queue %v, want empty", items)
 	}
-	logs, err := filepath.Glob(filepath.Join(h.stateDir, "runs", "maintenance-*.log"))
+	logs, err := filepath.Glob(filepath.Join(h.stateDir, "runs", "profile-*.log"))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -162,33 +206,32 @@ func TestPassConvergesSafeItem(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if len(verdicts) != 1 {
-		t.Errorf("got %d verdicts, want 1 (the summary is not a verdict)", len(verdicts))
+	if len(verdicts) != 2 {
+		t.Errorf("got %d verdicts, want 2 (measure and verify)", len(verdicts))
+	}
+	if last := verdicts[len(verdicts)-1]; last.State != "live" {
+		t.Errorf("newest verdict is %q, want live", last.State)
 	}
 }
 
 func TestPassEscalatesWhenStateDoesNotMove(t *testing.T) {
 	withVerifyDelays(t, time.Second, 2*time.Second, 3*time.Second)
-	drift := []contract.Record{
-		rec("hermes", contract.NotLive, "install/host-setup.sh --only hermes --apply"),
-		summary(contract.NotLive),
-	}
-	h := newHarness(t, drift)
+	h := newHarness(t, profileDrift())
 
 	result, err := h.engine.Pass(context.Background())
 	if err != nil {
 		t.Fatalf("Pass: %v", err)
 	}
-	if len(result.Escalated) != 1 || result.Escalated[0] != "hermes" {
+	if len(result.Escalated) != 1 || result.Escalated[0] != "profile" {
 		t.Fatalf("escalated %v", result.Escalated)
 	}
 	if len(h.sleeps) != 3 {
 		t.Errorf("verified %d times, want 3", len(h.sleeps))
 	}
 	items := h.queued(t)
-	item, ok := items["hermes"]
+	item, ok := items["profile"]
 	if !ok {
-		t.Fatal("hermes not queued after an unchanged measurement")
+		t.Fatal("profile not queued after an unchanged measurement")
 	}
 	if item.Attempts != 1 {
 		t.Errorf("attempts %d, want 1", item.Attempts)
@@ -232,14 +275,37 @@ func TestPassQueuesUnsafeItemWithoutRunning(t *testing.T) {
 	}
 }
 
-func TestPassRespectsBackoff(t *testing.T) {
-	withVerifyDelays(t, time.Second)
+func TestPassQueuesTheBlockingPrecondition(t *testing.T) {
 	h := newHarness(t, []contract.Record{
 		rec("hermes", contract.NotLive, "install/host-setup.sh --only hermes --apply"),
+		rec("patch-train", contract.NotLive, "install/host-setup.sh --only patch-train --apply"),
+		rec("notebook", contract.NotLive, "install/host-setup.sh --only notebook --apply"),
 		summary(contract.NotLive),
 	})
+	if _, err := h.engine.Pass(context.Background()); err != nil {
+		t.Fatalf("Pass: %v", err)
+	}
+	if len(h.runs) != 0 {
+		t.Errorf("ran %v, want no command outside the safe set", h.runs)
+	}
+	want := map[string]string{
+		"hermes":      termNeedsTTY,
+		"patch-train": termNeedsGrant,
+		"notebook":    termNeedsOperator,
+	}
+	items := h.queued(t)
+	for id, term := range want {
+		if got := items[id].Term; got != term {
+			t.Errorf("%s term %q, want %q", id, got, term)
+		}
+	}
+}
+
+func TestPassRespectsBackoff(t *testing.T) {
+	withVerifyDelays(t, time.Second)
+	h := newHarness(t, profileDrift())
 	future := fixedNow.Add(time.Hour)
-	queue := state.Queue{Items: []state.Item{{ID: "hermes", Term: termDidNotHold, FirstSeen: fixedNow.Add(-time.Hour), Attempts: 2, NextAttemptAt: future}}}
+	queue := state.Queue{Items: []state.Item{{ID: "profile", Term: termDidNotHold, FirstSeen: fixedNow.Add(-time.Hour), Attempts: 2, NextAttemptAt: future}}}
 	if _, err := h.store.SaveQueue(queue); err != nil {
 		t.Fatal(err)
 	}
@@ -248,35 +314,31 @@ func TestPassRespectsBackoff(t *testing.T) {
 	if err != nil {
 		t.Fatalf("Pass: %v", err)
 	}
-	if len(result.Skipped) != 1 || result.Skipped[0] != "hermes" {
+	if len(result.Skipped) != 1 || result.Skipped[0] != "profile" {
 		t.Fatalf("skipped %v", result.Skipped)
 	}
 	if len(h.runs) != 0 {
 		t.Errorf("ran %v during backoff", h.runs)
 	}
 	items := h.queued(t)
-	if items["hermes"].Term != termBackoff {
-		t.Errorf("term %q, want %q", items["hermes"].Term, termBackoff)
+	if items["profile"].Term != termBackoff {
+		t.Errorf("term %q, want %q", items["profile"].Term, termBackoff)
 	}
-	if items["hermes"].Attempts != 2 {
-		t.Errorf("attempts changed to %d during backoff", items["hermes"].Attempts)
+	if items["profile"].Attempts != 2 {
+		t.Errorf("attempts changed to %d during backoff", items["profile"].Attempts)
 	}
 }
 
 func TestPassKeepsAttemptsAcrossFailures(t *testing.T) {
 	withVerifyDelays(t, time.Second)
-	drift := []contract.Record{
-		rec("hermes", contract.NotLive, "install/host-setup.sh --only hermes --apply"),
-		summary(contract.NotLive),
-	}
-	h := newHarness(t, drift, drift)
+	h := newHarness(t, profileDrift(), profileDrift())
 	if _, err := h.engine.Pass(context.Background()); err != nil {
 		t.Fatalf("first Pass: %v", err)
 	}
 
 	// Move the clock past the backoff by rewriting the item's due time.
 	items := h.queued(t)
-	item := items["hermes"]
+	item := items["profile"]
 	item.NextAttemptAt = fixedNow.Add(-time.Minute)
 	if _, err := h.store.SaveQueue(state.Queue{Items: []state.Item{item}}); err != nil {
 		t.Fatal(err)
@@ -286,11 +348,11 @@ func TestPassKeepsAttemptsAcrossFailures(t *testing.T) {
 		t.Fatalf("second Pass: %v", err)
 	}
 	items = h.queued(t)
-	if got := items["hermes"].Attempts; got != 2 {
+	if got := items["profile"].Attempts; got != 2 {
 		t.Errorf("attempts %d, want 2", got)
 	}
 	wantNext := fixedNow.Add(30 * time.Minute)
-	if got := items["hermes"].NextAttemptAt; !got.Equal(wantNext) {
+	if got := items["profile"].NextAttemptAt; !got.Equal(wantNext) {
 		t.Errorf("next attempt %v, want %v", got, wantNext)
 	}
 }
@@ -312,20 +374,128 @@ func TestPassDropsItemWhenItLeavesTheQueue(t *testing.T) {
 	}
 }
 
-func TestPassIgnoresUnknown(t *testing.T) {
+func TestPassQueuesUnknownWithoutRunning(t *testing.T) {
 	h := newHarness(t, []contract.Record{
-		rec("backup", contract.Unknown, ""),
+		rec("backup", contract.Unknown, "install/host-setup.sh --only backup --apply"),
 		summary(contract.Unknown),
 	})
 	result, err := h.engine.Pass(context.Background())
 	if err != nil {
 		t.Fatalf("Pass: %v", err)
 	}
-	if len(result.Queued) != 0 || len(result.Escalated) != 0 {
-		t.Errorf("unknown record queued: %+v", result)
+	if len(result.Queued) != 1 || result.Queued[0] != "backup" {
+		t.Fatalf("queued %v, want the unknown item", result.Queued)
 	}
-	if items := h.queued(t); len(items) != 0 {
-		t.Errorf("queue %v, want empty", items)
+	if len(h.runs) != 0 {
+		t.Errorf("ran %v, want no repair on an unknown measurement", h.runs)
+	}
+	item, ok := h.queued(t)["backup"]
+	if !ok {
+		t.Fatal("an unknown measurement vanished from the queue")
+	}
+	if item.Term != termUnverified {
+		t.Errorf("term %q, want %q", item.Term, termUnverified)
+	}
+}
+
+func TestPassRequiresALiveVerification(t *testing.T) {
+	withVerifyDelays(t, time.Second, 2*time.Second)
+	h := newHarness(t,
+		profileDrift(),
+		[]contract.Record{rec("profile", contract.Unknown, ""), summary(contract.Unknown)},
+	)
+	result, err := h.engine.Pass(context.Background())
+	if err != nil {
+		t.Fatalf("Pass: %v", err)
+	}
+	if len(result.Converged) != 0 {
+		t.Fatalf("converged %v on an unknown verification", result.Converged)
+	}
+	if len(result.Escalated) != 1 || result.Escalated[0] != "profile" {
+		t.Fatalf("escalated %v", result.Escalated)
+	}
+	if term := h.queued(t)["profile"].Term; term != termDidNotHold {
+		t.Errorf("term %q, want %q", term, termDidNotHold)
+	}
+}
+
+func TestPassRequiresTheRecordToBePresent(t *testing.T) {
+	withVerifyDelays(t, time.Second, 2*time.Second)
+	h := newHarness(t,
+		profileDrift(),
+		[]contract.Record{summary(contract.Live)},
+	)
+	result, err := h.engine.Pass(context.Background())
+	if err != nil {
+		t.Fatalf("Pass: %v", err)
+	}
+	if len(result.Converged) != 0 {
+		t.Fatalf("converged %v with the item absent from the verification", result.Converged)
+	}
+	if len(result.Escalated) != 1 {
+		t.Fatalf("escalated %v", result.Escalated)
+	}
+	if term := h.queued(t)["profile"].Term; term != termDidNotHold {
+		t.Errorf("term %q, want %q: an absent verification must not converge", term, termDidNotHold)
+	}
+}
+
+func TestPassNamesAFailedScan(t *testing.T) {
+	h := newHarness(t, profileDrift())
+	h.engine.agents = func() ([]Agent, error) { return nil, errors.New("cannot read /proc") }
+
+	if _, err := h.engine.Pass(context.Background()); err != nil {
+		t.Fatalf("Pass: %v", err)
+	}
+	if len(h.runs) != 0 {
+		t.Errorf("ran %v when no process could be checked", h.runs)
+	}
+	item, ok := h.queued(t)["profile"]
+	if !ok {
+		t.Fatal("the item vanished when the process scan failed")
+	}
+	if item.Term != termScan {
+		t.Errorf("term %q, want %q", item.Term, termScan)
+	}
+}
+
+func TestPassWaitsWhileAHoldIsLive(t *testing.T) {
+	h := newHarness(t, profileDrift())
+	hold := state.Hold{Owner: "pid-agent", Reason: "agent run", PID: os.Getpid(), Start: fixedNow.Add(-time.Minute)}
+	if err := h.store.AddHold(hold); err != nil {
+		t.Fatal(err)
+	}
+	result, err := h.engine.Pass(context.Background())
+	if err != nil {
+		t.Fatalf("Pass: %v", err)
+	}
+	if len(h.runs) != 0 {
+		t.Errorf("ran %v while a hold was live", h.runs)
+	}
+	if len(result.Skipped) != 1 || result.Skipped[0] != "profile" {
+		t.Fatalf("skipped %v", result.Skipped)
+	}
+	if term := h.queued(t)["profile"].Term; term != termHold {
+		t.Errorf("term %q, want %q", term, termHold)
+	}
+}
+
+func TestPassWaitsWhileAnAgentHasNoHold(t *testing.T) {
+	h := newHarness(t, profileDrift())
+	h.engine.agents = func() ([]Agent, error) { return []Agent{{PID: 4242, Name: "opencode"}}, nil }
+
+	result, err := h.engine.Pass(context.Background())
+	if err != nil {
+		t.Fatalf("Pass: %v", err)
+	}
+	if len(h.runs) != 0 {
+		t.Errorf("ran %v over an unclaimed agent", h.runs)
+	}
+	if len(result.Skipped) != 1 {
+		t.Fatalf("skipped %v, want the item held", result.Skipped)
+	}
+	if term := h.queued(t)["profile"].Term; term != termHold {
+		t.Errorf("term %q, want %q", term, termHold)
 	}
 }
 
@@ -336,11 +506,195 @@ func TestPassFailsWhenMeasureFails(t *testing.T) {
 	}
 }
 
-func TestPassRefusesConcurrentRun(t *testing.T) {
+func TestSecondEngineCannotPassWhileTheFirstHoldsTheLock(t *testing.T) {
+	withVerifyDelays(t, time.Millisecond)
+	h := newHarness(t, profileDrift())
+	entered := make(chan struct{})
+	release := make(chan struct{})
+	var once sync.Once
+	h.engine.measure = func(context.Context) ([]contract.Record, error) {
+		once.Do(func() { close(entered) })
+		<-release
+		return profileDrift(), nil
+	}
+
+	done := make(chan error, 1)
+	go func() {
+		_, err := h.engine.Pass(context.Background())
+		done <- err
+	}()
+	<-entered // Pass holds the lock before it measures.
+
+	second := secondEngine(t, h.stateDir)
+	if _, err := second.Pass(context.Background()); !errors.Is(err, state.ErrLocked) {
+		t.Fatalf("second pass error %v, want ErrLocked", err)
+	}
+	close(release)
+	if err := <-done; err != nil {
+		t.Fatalf("first Pass: %v", err)
+	}
+}
+
+func TestPassAppendsVerificationVerdicts(t *testing.T) {
+	withVerifyDelays(t, time.Second)
+	h := newHarness(t, profileDrift(), profileLive())
+	if _, err := h.engine.Pass(context.Background()); err != nil {
+		t.Fatalf("Pass: %v", err)
+	}
+	verdicts, err := h.store.Verdicts()
+	if err != nil {
+		t.Fatal(err)
+	}
+	var states []string
+	for _, v := range verdicts {
+		if v.ID == "profile" {
+			states = append(states, v.State)
+		}
+	}
+	if len(states) != 2 || states[0] != "not-live" || states[1] != "live" {
+		t.Fatalf("profile verdicts %v, want [not-live live]", states)
+	}
+}
+
+func TestDeferWritesAVerdictAndMovesTheItem(t *testing.T) {
+	h := newHarness(t, []contract.Record{
+		rec("offsite", contract.NotLive, "install/offsite-oauth-wizard.sh"),
+		summary(contract.NotLive),
+	})
+	if _, err := h.engine.Pass(context.Background()); err != nil {
+		t.Fatalf("Pass: %v", err)
+	}
+
+	until, err := h.engine.Defer("offsite", 2*time.Hour, "waiting on the provider")
+	if err != nil {
+		t.Fatalf("Defer: %v", err)
+	}
+	if want := fixedNow.Add(2 * time.Hour); !until.Equal(want) {
+		t.Errorf("until %v, want %v", until, want)
+	}
+	item := h.queued(t)["offsite"]
+	if item.Term != termDeferred {
+		t.Errorf("term %q, want %q", item.Term, termDeferred)
+	}
+	if !item.NextAttemptAt.Equal(fixedNow.Add(2 * time.Hour)) {
+		t.Errorf("next attempt %v", item.NextAttemptAt)
+	}
+
+	verdicts, err := h.store.Verdicts()
+	if err != nil {
+		t.Fatal(err)
+	}
+	var record *state.Verdict
+	for i := range verdicts {
+		if verdicts[i].IsDeferral() {
+			record = &verdicts[i]
+		}
+	}
+	if record == nil {
+		t.Fatal("no defer record was appended to the verdict log")
+	}
+	if record.ID != "offsite" || record.Kind != state.KindDefer {
+		t.Errorf("defer record %+v, want id offsite and kind %q", record, state.KindDefer)
+	}
+	if record.Detail != "waiting on the provider" {
+		t.Errorf("defer record detail %q, want the reason", record.Detail)
+	}
+	if !record.Until.Equal(fixedNow.Add(2 * time.Hour)) {
+		t.Errorf("defer record until %v, want %v", record.Until, fixedNow.Add(2*time.Hour))
+	}
+
+	deferred, err := h.store.Deferrals()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if deferred["offsite"].Detail != "waiting on the provider" {
+		t.Errorf("deferral %+v, want the reason recorded", deferred["offsite"])
+	}
+
+	// A later pass replays the deferral even though the probe still reports it.
+	result, err := h.engine.Pass(context.Background())
+	if err != nil {
+		t.Fatalf("second Pass: %v", err)
+	}
+	if len(result.Skipped) != 1 || result.Skipped[0] != "offsite" {
+		t.Fatalf("skipped %v, want the deferred item", result.Skipped)
+	}
+	if term := h.queued(t)["offsite"].Term; term != termDeferred {
+		t.Errorf("term %q after replay, want %q", term, termDeferred)
+	}
+}
+
+func TestDeferRejectsBadInput(t *testing.T) {
 	h := newHarness(t, []contract.Record{summary(contract.Live)})
-	h.engine.busy.Store(true)
-	if _, err := h.engine.Pass(context.Background()); err == nil {
-		t.Fatal("Pass ran while another pass held the engine")
+	if _, err := h.engine.Defer("a/b", time.Hour, "reason"); err == nil {
+		t.Error("Defer accepted a non-slug id")
+	}
+	if _, err := h.engine.Defer("offsite", time.Second, "reason"); err == nil {
+		t.Error("Defer accepted a sub-minute duration")
+	}
+}
+
+func TestPassEvaluatesRebootFromPass(t *testing.T) {
+	h := newHarness(t, []contract.Record{summary(contract.Live)})
+	h.engine.cfg.RebootFromPass = true
+	h.engine.adapters = map[adapter.Family]adapter.Adapter{
+		adapter.Arch: {Family: adapter.Arch, Stage: []string{"patch-train-update"}, Activate: []string{"omarchy-system", "reboot"}},
+	}
+
+	result, err := h.engine.Pass(context.Background())
+	if err != nil {
+		t.Fatalf("Pass: %v", err)
+	}
+	if !result.Reboot.Allowed {
+		t.Fatalf("pass verdict %+v, want allowed", result.Reboot)
+	}
+	if len(h.activations) != 1 || strings.Join(h.activations[0], " ") != "omarchy-system reboot" {
+		t.Fatalf("activations %v, want omarchy-system reboot", h.activations)
+	}
+}
+
+func TestPassQueuesABlockedReboot(t *testing.T) {
+	h := newHarness(t, []contract.Record{summary(contract.Live)})
+	h.engine.cfg.RebootFromPass = true
+	h.engine.adapters = map[adapter.Family]adapter.Adapter{
+		adapter.Arch: {Family: adapter.Arch, Stage: []string{"patch-train-update"}, Activate: []string{"omarchy-system", "reboot"}},
+	}
+	h.session = true
+
+	result, err := h.engine.Pass(context.Background())
+	if err != nil {
+		t.Fatalf("Pass: %v", err)
+	}
+	if result.Reboot.Allowed || result.Reboot.Term != TermSession {
+		t.Fatalf("verdict %+v, want blocked on session", result.Reboot)
+	}
+	item, ok := h.queued(t)[RebootID]
+	if !ok {
+		t.Fatal("the blocked reboot was not queued")
+	}
+	if item.Term != TermSession {
+		t.Errorf("term %q, want %q", item.Term, TermSession)
+	}
+	if len(h.activations) != 0 {
+		t.Errorf("activations %v, want none", h.activations)
+	}
+}
+
+func TestPassKeepsAQueuedRebootItem(t *testing.T) {
+	h := newHarness(t, []contract.Record{summary(contract.Live)})
+	seed := state.Item{ID: RebootID, Term: TermWindow, FirstSeen: fixedNow.Add(-time.Hour)}
+	if _, err := h.store.SaveQueue(state.Queue{Items: []state.Item{seed}}); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := h.engine.Pass(context.Background()); err != nil {
+		t.Fatalf("Pass: %v", err)
+	}
+	item, ok := h.queued(t)[RebootID]
+	if !ok {
+		t.Fatal("the queued reboot was dropped by the pass")
+	}
+	if !item.FirstSeen.Equal(seed.FirstSeen) {
+		t.Errorf("first seen %v, want %v", item.FirstSeen, seed.FirstSeen)
 	}
 }
 
@@ -366,14 +720,28 @@ func TestBackoff(t *testing.T) {
 }
 
 func TestSafeSet(t *testing.T) {
-	for _, id := range []string{"hermes", "maintenance", "notebook", "profile"} {
-		if !safeToConverge(id) {
-			t.Errorf("%s should be safe", id)
-		}
+	if !safeToConverge("profile") {
+		t.Error("profile should be safe")
 	}
-	for _, id := range []string{"patch-train", "offsite", "backup", "branch-x", "reboot", ""} {
+	for _, id := range []string{"hermes", "maintenance", "notebook", "patch-train", "offsite", "backup", "branch-x", "reboot", ""} {
 		if safeToConverge(id) {
 			t.Errorf("%s should not be safe", id)
+		}
+	}
+}
+
+func TestRepairTerm(t *testing.T) {
+	tests := map[string]string{
+		"maintenance": termNeedsTTY,
+		"hermes":      termNeedsTTY,
+		"patch-train": termNeedsGrant,
+		"notebook":    termNeedsOperator,
+		"offsite":     termNeedsOperator,
+		"branch-x":    termNeedsOperator,
+	}
+	for id, want := range tests {
+		if got := repairTerm(id); got != want {
+			t.Errorf("repairTerm(%q) = %q, want %q", id, got, want)
 		}
 	}
 }
@@ -395,6 +763,23 @@ func TestStatusReadsQueueHoldsAndVerdicts(t *testing.T) {
 	}
 	if len(status.Holds) != 0 {
 		t.Errorf("holds %v, want none", status.Holds)
+	}
+}
+
+func TestStatusHidesDeferralsFromVerdicts(t *testing.T) {
+	h := newHarness(t, []contract.Record{summary(contract.Live)})
+	if err := h.store.AppendVerdict(state.Verdict{ID: "offsite", State: "not-live", At: fixedNow}); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := h.engine.Defer("offsite", time.Hour, "later"); err != nil {
+		t.Fatal(err)
+	}
+	status, err := h.engine.Status()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got := status.Verdicts["offsite"].State; got != "not-live" {
+		t.Errorf("state %q, want the measurement to survive the deferral", got)
 	}
 }
 
@@ -421,14 +806,11 @@ func TestNewValidatesConfig(t *testing.T) {
 
 func TestPassWritesRunLogContent(t *testing.T) {
 	withVerifyDelays(t, time.Second)
-	h := newHarness(t,
-		[]contract.Record{rec("hermes", contract.NotLive, "install/host-setup.sh --only hermes --apply"), summary(contract.NotLive)},
-		[]contract.Record{rec("hermes", contract.Live, ""), summary(contract.Live)},
-	)
+	h := newHarness(t, profileDrift(), profileLive())
 	if _, err := h.engine.Pass(context.Background()); err != nil {
 		t.Fatalf("Pass: %v", err)
 	}
-	logs, err := filepath.Glob(filepath.Join(h.stateDir, "runs", "hermes-*.log"))
+	logs, err := filepath.Glob(filepath.Join(h.stateDir, "runs", "profile-*.log"))
 	if err != nil || len(logs) != 1 {
 		t.Fatalf("run logs %v (%v)", logs, err)
 	}
@@ -436,7 +818,7 @@ func TestPassWritesRunLogContent(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	for _, want := range []string{"item: hermes", "command: install/host-setup.sh --only hermes --apply", "converged"} {
+	for _, want := range []string{"item: profile", "command: install/profile-select.sh laptop-omarchy", "converged"} {
 		if !strings.Contains(string(body), want) {
 			t.Errorf("run log does not contain %q:\n%s", want, body)
 		}

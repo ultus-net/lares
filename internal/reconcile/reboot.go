@@ -7,6 +7,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"time"
 
@@ -19,8 +20,11 @@ const RebootID = "reboot"
 
 // Reboot terms, in the order the gate evaluates them.
 const (
-	TermWindow  = "window"
-	TermHold    = "hold"
+	TermWindow = "window"
+	TermHold   = "hold"
+	// TermScan means no process could be checked, so an unclaimed agent cannot
+	// be ruled out. It is not a hold the operator wrote.
+	TermScan    = "scan"
 	TermSession = "session"
 	TermOwnJob  = "own-job"
 )
@@ -30,12 +34,26 @@ type RebootVerdict struct {
 	Allowed bool
 	Term    string
 	HoldAge time.Duration
-	// Unclaimed names long-horizon processes that are running without a hold.
+	// Unclaimed names long-horizon processes that are running without a hold,
+	// or why the process scan failed.
 	Unclaimed []string
 }
 
-// RebootAllowed evaluates the four terms without changing anything.
+// RebootAllowed evaluates the gate without changing anything.
+//
+// It takes the state lock for the read, so a dry run never observes a queue or a
+// hold set that a pass is halfway through rewriting.
 func (e *Engine) RebootAllowed(ctx context.Context) (RebootVerdict, error) {
+	if err := e.store.Lock(); err != nil {
+		return RebootVerdict{}, err
+	}
+	defer e.store.Unlock()
+	return e.rebootAllowedLocked(ctx)
+}
+
+// rebootAllowedLocked is the gate without the lock. A pass calls it while it
+// already holds the lock.
+func (e *Engine) rebootAllowedLocked(ctx context.Context) (RebootVerdict, error) {
 	if !e.cfg.Window.Contains(e.now()) {
 		return RebootVerdict{Term: TermWindow}, nil
 	}
@@ -44,7 +62,10 @@ func (e *Engine) RebootAllowed(ctx context.Context) (RebootVerdict, error) {
 	if err != nil {
 		return RebootVerdict{}, err
 	}
-	unclaimed := e.unclaimedAgents(holds)
+	unclaimed, err := e.unclaimedAgents(holds)
+	if err != nil {
+		return RebootVerdict{Term: TermScan, Unclaimed: []string{"process scan failed: " + err.Error()}}, nil
+	}
 	if len(holds) > 0 || len(unclaimed) > 0 {
 		var age time.Duration
 		for _, hold := range holds {
@@ -63,9 +84,6 @@ func (e *Engine) RebootAllowed(ctx context.Context) (RebootVerdict, error) {
 		return RebootVerdict{Term: TermSession}, nil
 	}
 
-	if e.busy.Load() {
-		return RebootVerdict{Term: TermOwnJob}, nil
-	}
 	running, err := e.train(ctx)
 	if err != nil {
 		return RebootVerdict{Term: TermOwnJob}, nil
@@ -77,9 +95,20 @@ func (e *Engine) RebootAllowed(ctx context.Context) (RebootVerdict, error) {
 }
 
 // Reboot either activates the family's reboot verb or queues the term that
-// blocked it. It returns the verdict it acted on.
+// blocked it. The check and the activation share one lock hold, so nothing can
+// start a repair in between.
 func (e *Engine) Reboot(ctx context.Context) (RebootVerdict, error) {
-	verdict, err := e.RebootAllowed(ctx)
+	if err := e.store.Lock(); err != nil {
+		return RebootVerdict{}, err
+	}
+	defer e.store.Unlock()
+	return e.rebootLocked(ctx)
+}
+
+// rebootLocked is Reboot without the lock. A pass calls it last, while it still
+// holds the lock.
+func (e *Engine) rebootLocked(ctx context.Context) (RebootVerdict, error) {
+	verdict, err := e.rebootAllowedLocked(ctx)
 	if err != nil {
 		return verdict, err
 	}
@@ -111,20 +140,16 @@ func (e *Engine) queueBlockedReboot(v RebootVerdict) error {
 	}
 	now := e.now()
 	item := state.Item{ID: RebootID, Term: v.Term, FirstSeen: now}
-	for _, existing := range queue.Items {
-		if existing.ID == RebootID {
-			item = existing
-			item.Term = v.Term
-			break
-		}
-	}
 	replaced := false
 	for i, existing := range queue.Items {
 		if existing.ID != RebootID {
 			continue
 		}
+		item = existing
+		item.Term = v.Term
 		queue.Items[i] = item
 		replaced = true
+		break
 	}
 	if !replaced {
 		queue.Items = append(queue.Items, item)
@@ -163,33 +188,58 @@ var longHorizon = map[string]bool{
 }
 
 // unclaimedAgents names long-horizon processes with no hold that claims them.
-func (e *Engine) unclaimedAgents(holds []state.Hold) []string {
+//
+// A hold claims one process by pid and start time. It never claims a process
+// because the hold's reason happens to contain the program name, so two agents of
+// the same kind need two holds.
+func (e *Engine) unclaimedAgents(holds []state.Hold) ([]string, error) {
+	agents, err := e.agents()
+	if err != nil {
+		return nil, err
+	}
 	var unclaimed []string
-	for _, name := range e.agents() {
+	for _, agent := range agents {
 		claimed := false
 		for _, hold := range holds {
-			if strings.Contains(hold.Owner, name) || strings.Contains(hold.Reason, name) {
+			if holdClaims(hold, agent) {
 				claimed = true
 				break
 			}
 		}
 		if !claimed {
-			unclaimed = append(unclaimed, name)
+			unclaimed = append(unclaimed, fmt.Sprintf("%s[%d]", agent.Name, agent.PID))
 		}
 	}
-	return unclaimed
+	return unclaimed, nil
+}
+
+// holdClaims reports whether hold names this exact process instance.
+func holdClaims(hold state.Hold, agent Agent) bool {
+	if hold.PID <= 0 || hold.PID != agent.PID {
+		return false
+	}
+	if hold.StartTicks == 0 || agent.StartTicks == 0 {
+		return true
+	}
+	return hold.StartTicks == agent.StartTicks
 }
 
 // defaultAgents scans /proc for long-horizon processes.
-func defaultAgents() []string {
+//
+// A directory read that fails is an error, because returning no agents would
+// claim the host is clear when nothing was checked.
+func defaultAgents() ([]Agent, error) {
 	entries, err := os.ReadDir("/proc")
 	if err != nil {
-		return nil
+		return nil, fmt.Errorf("read /proc: %w", err)
 	}
-	seen := make(map[string]bool)
-	var found []string
+	var found []Agent
 	for _, entry := range entries {
 		if !entry.IsDir() || !isPID(entry.Name()) {
+			continue
+		}
+		pid, err := strconv.Atoi(entry.Name())
+		if err != nil {
 			continue
 		}
 		data, err := os.ReadFile(filepath.Join("/proc", entry.Name(), "comm"))
@@ -197,12 +247,13 @@ func defaultAgents() []string {
 			continue
 		}
 		name := strings.TrimSpace(string(data))
-		if longHorizon[name] && !seen[name] {
-			seen[name] = true
-			found = append(found, name)
+		if !longHorizon[name] {
+			continue
 		}
+		ticks, _ := state.ProcessStartTicks(pid)
+		found = append(found, Agent{PID: pid, Name: name, StartTicks: ticks})
 	}
-	return found
+	return found, nil
 }
 
 // isPID reports whether name is all digits.
@@ -221,8 +272,8 @@ func isPID(name string) bool {
 // defaultSessionActive reports whether a person is still using the machine.
 //
 // A locked screen counts: the session is still there to lose work. Omarchy's
-// stay-awake marker counts, and so does an inhibitor a build left behind. The
-// check fails closed: if loginctl cannot answer, the host is treated as in use.
+// stay-awake marker counts too. The check fails closed: if loginctl cannot
+// answer, the host is treated as in use.
 func defaultSessionActive(ctx context.Context) (bool, error) {
 	if home, err := os.UserHomeDir(); err == nil {
 		marker := filepath.Join(home, ".local", "state", "omarchy", "indicators", "stay-awake")
@@ -252,18 +303,73 @@ func defaultSessionActive(ctx context.Context) (bool, error) {
 	return false, nil
 }
 
-// defaultTrainRunning asks Omarchy whether an update train holds its lock.
+// trainProcesses names the programs that hold an update lock on a family.
+//
+// Fedora has no lock file the way Omarchy does, so the check looks for the
+// transaction program itself.
+var trainProcesses = map[adapter.Family][]string{
+	adapter.FedoraAtomic: {"rpm-ostree"},
+	adapter.Bootc:        {"bootc"},
+}
+
+// runningCommands lists the command names in /proc. Tests replace it.
+var runningCommands = func() ([]string, error) {
+	entries, err := os.ReadDir("/proc")
+	if err != nil {
+		return nil, fmt.Errorf("read /proc: %w", err)
+	}
+	var names []string
+	for _, entry := range entries {
+		if !entry.IsDir() || !isPID(entry.Name()) {
+			continue
+		}
+		data, err := os.ReadFile(filepath.Join("/proc", entry.Name(), "comm"))
+		if err != nil {
+			// The process exited between the directory read and this read.
+			continue
+		}
+		names = append(names, strings.TrimSpace(string(data)))
+	}
+	return names, nil
+}
+
+// defaultTrainRunning reports whether an update transaction holds the host.
+//
+// Arch asks Omarchy: exit 0 means held and exit 1 means not held, and any other
+// result is an error. Fedora families look for the transaction program. An
+// unrecognised family has no check at all, which is an error, so the gate blocks
+// instead of guessing that the train is idle.
 func defaultTrainRunning(ctx context.Context, family adapter.Family) (bool, error) {
-	if family != adapter.Arch {
+	if names, ok := trainProcesses[family]; ok {
+		running, err := runningCommands()
+		if err != nil {
+			return false, err
+		}
+		for _, name := range running {
+			for _, want := range names {
+				if name == want {
+					return true, nil
+				}
+			}
+		}
 		return false, nil
 	}
-	err := exec.CommandContext(ctx, "omarchy-update-lock", "held").Run()
+	if family != adapter.Arch {
+		return false, fmt.Errorf("no update-train check for family %q", family)
+	}
+	cmd := exec.CommandContext(ctx, "omarchy-update-lock", "held")
+	var stderr strings.Builder
+	cmd.Stderr = &stderr
+	err := cmd.Run()
 	if err == nil {
 		return true, nil
 	}
 	var exit *exec.ExitError
-	if errors.As(err, &exit) {
+	if !errors.As(err, &exit) {
+		return false, fmt.Errorf("omarchy-update-lock: %w", err)
+	}
+	if exit.ExitCode() == 1 {
 		return false, nil
 	}
-	return false, nil
+	return false, fmt.Errorf("omarchy-update-lock exited %d: %s", exit.ExitCode(), strings.TrimSpace(stderr.String()))
 }

@@ -1,8 +1,8 @@
 // Package install writes the lares binary, the systemd units, and the config.
 //
 // It never touches sudoers and never enables linger. Both grant privilege or
-// change session policy, so the installer prints the exact commands and the
-// operator runs them.
+// change session policy, so the installer prints the one command it will not run
+// and the operator runs it. A repair that needs root stays in the queue.
 package install
 
 import (
@@ -11,7 +11,6 @@ import (
 	"io"
 	"io/fs"
 	"os"
-	"os/exec"
 	"path/filepath"
 	"sort"
 	"strings"
@@ -29,17 +28,22 @@ type Options struct {
 	Adapters   map[adapter.Family]adapter.Adapter
 }
 
-// Install writes the binary, the units, the config, and the sudoers template.
+// Install writes the binary, the units, and the config.
 //
-// The binary and the units are replaced on every run. config.toml,
-// adapters.toml, and lares.sudoers are created only when absent, so a re-install
-// never discards an edit. It returns the paths it wrote in order.
+// The binary and the units are replaced on every run. config.toml and
+// adapters.toml are created only when absent, so a re-install never discards an
+// edit. An empty adapter table is replaced with adapter.Defaults(). It returns
+// the paths it wrote in order.
 func Install(opts Options) ([]string, error) {
 	if opts.HomeDir == "" {
 		return nil, errors.New("install: home directory is required")
 	}
 	if opts.BinaryPath == "" {
 		return nil, errors.New("install: binary path is required")
+	}
+	adapters := opts.Adapters
+	if len(adapters) == 0 {
+		adapters = adapter.Defaults()
 	}
 
 	binaryPath := filepath.Join(opts.HomeDir, ".local", "bin", "lares")
@@ -55,7 +59,7 @@ func Install(opts Options) ([]string, error) {
 		return nil, fmt.Errorf("create unit directory: %w", err)
 	}
 	servicePath := filepath.Join(unitsDir, "lares.service")
-	if err := replaceFile(servicePath, ServiceUnit(), 0o644); err != nil {
+	if err := replaceFile(servicePath, ServiceUnit(opts.Config.RepoDir), 0o644); err != nil {
 		return nil, err
 	}
 	timerPath := filepath.Join(unitsDir, "lares.timer")
@@ -72,15 +76,11 @@ func Install(opts Options) ([]string, error) {
 		return nil, err
 	}
 	adapterPath := filepath.Join(configDir, "adapters.toml")
-	if err := createIfAbsent(adapterPath, AdaptersTOML(opts.Adapters), 0o600); err != nil {
-		return nil, err
-	}
-	sudoersPath := filepath.Join(configDir, "lares.sudoers")
-	if err := createIfAbsent(sudoersPath, SudoersText(opts.Adapters), 0o644); err != nil {
+	if err := createIfAbsent(adapterPath, AdaptersTOML(adapters), 0o600); err != nil {
 		return nil, err
 	}
 
-	return []string{binaryPath, servicePath, timerPath, configPath, adapterPath, sudoersPath}, nil
+	return []string{binaryPath, servicePath, timerPath, configPath, adapterPath}, nil
 }
 
 // copyFile copies src to dst, replacing dst.
@@ -147,9 +147,13 @@ func ConfigTOML(cfg config.Config) string {
 	fmt.Fprintf(&b, "audit_command = %s\n", tomlArray(cfg.AuditCommand))
 	fmt.Fprintf(&b, "state_dir = %q\n", cfg.StateDir)
 	fmt.Fprintf(&b, "config_dir = %q\n", cfg.ConfigDir)
+	if cfg.RepoDir != "" {
+		fmt.Fprintf(&b, "repo_dir = %q\n", cfg.RepoDir)
+	}
 	fmt.Fprintf(&b, "window_start = %q\n", cfg.WindowStart)
 	fmt.Fprintf(&b, "window_end = %q\n", cfg.WindowEnd)
 	fmt.Fprintf(&b, "resync = %q\n", cfg.ResyncText)
+	fmt.Fprintf(&b, "reboot_from_pass = %t\n", cfg.RebootFromPass)
 	if cfg.AdapterOverride != "" {
 		fmt.Fprintf(&b, "adapter_override = %q\n", cfg.AdapterOverride)
 	}
@@ -200,8 +204,13 @@ func tomlArray(argv []string) string {
 }
 
 // ServiceUnit returns lares.service.
-func ServiceUnit() string {
-	return `[Unit]
+//
+// A non-empty repoDir becomes WorkingDirectory, so the installed timer finds the
+// probe in the checkout it was configured against instead of the unit's default
+// working directory.
+func ServiceUnit(repoDir string) string {
+	var b strings.Builder
+	b.WriteString(`[Unit]
 Description=lares reconcile pass
 
 [Service]
@@ -209,7 +218,11 @@ Type=oneshot
 ExecStart=%h/.local/bin/lares pass
 Nice=10
 IOSchedulingClass=idle
-`
+`)
+	if repoDir != "" {
+		fmt.Fprintf(&b, "WorkingDirectory=%s\n", repoDir)
+	}
+	return b.String()
 }
 
 // TimerUnit returns lares.timer for the given interval.
@@ -227,74 +240,16 @@ WantedBy=timers.target
 `, resync)
 }
 
-// SudoersText renders the drop-in for the stage verbs.
+// NextSteps returns the commands the operator runs once per host.
 //
-// Each stage program is resolved to an absolute path now, because sudoers does
-// not search PATH. A program that is not installed yet falls back to
-// /usr/local/bin, and the operator fixes the path before installing the file.
-func SudoersText(adapters map[adapter.Family]adapter.Adapter) string {
-	programs := uniqueStagePrograms(adapters)
-	var b strings.Builder
-	b.WriteString("# lares: the stage verbs this host may run as root.\n")
-	b.WriteString("# Review the paths, then install with:\n")
-	b.WriteString("#   sudo install -m 0440 lares.sudoers /etc/sudoers.d/lares\n")
-	if len(programs) == 0 {
-		b.WriteString("# No adapters configured, so no command is granted.\n")
-		return b.String()
-	}
-	b.WriteString("Cmnd_Alias LARES_STAGE = ")
-	paths := make([]string, 0, len(programs))
-	for _, program := range programs {
-		paths = append(paths, resolvedProgram(program))
-	}
-	b.WriteString(strings.Join(paths, ", "))
-	b.WriteString("\n")
-	b.WriteString("# Change the group to the one your user belongs to.\n")
-	b.WriteString("%wheel ALL=(root) NOPASSWD: LARES_STAGE\n")
-	return b.String()
-}
-
-// uniqueStagePrograms returns the stage programs once, sorted.
-func uniqueStagePrograms(adapters map[adapter.Family]adapter.Adapter) []string {
-	seen := make(map[string]bool)
-	var programs []string
-	for _, entry := range adapters {
-		if len(entry.Stage) == 0 {
-			continue
-		}
-		program := entry.Stage[0]
-		if program == "" || seen[program] {
-			continue
-		}
-		seen[program] = true
-		programs = append(programs, program)
-	}
-	sort.Strings(programs)
-	return programs
-}
-
-// resolvedProgram returns an absolute path for a stage program.
-func resolvedProgram(program string) string {
-	if filepath.IsAbs(program) {
-		return program
-	}
-	if path, err := exec.LookPath(program); err == nil {
-		if absolute, err := filepath.Abs(path); err == nil {
-			return absolute
-		}
-	}
-	return filepath.Join("/usr/local/bin", program)
-}
-
-// NextSteps returns the two commands the operator runs once per host.
-func NextSteps(homeDir string) []string {
+// There is no sudoers step: lares never asks for a standing grant, so a repair
+// that needs root stays queued until the operator runs it.
+func NextSteps() []string {
 	user := os.Getenv("USER")
 	if user == "" {
 		user = "$USER"
 	}
-	sudoers := filepath.Join(homeDir, ".config", "lares", "lares.sudoers")
 	return []string{
-		fmt.Sprintf("sudo install -m 0440 %s /etc/sudoers.d/lares", sudoers),
 		fmt.Sprintf("loginctl enable-linger %s", user),
 	}
 }

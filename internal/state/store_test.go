@@ -316,32 +316,16 @@ func TestAddHoldReplacesSameOwner(t *testing.T) {
 	}
 }
 
-func TestHoldOwnerIsSanitised(t *testing.T) {
+func TestAddHoldRejectsNonSlugOwner(t *testing.T) {
 	s := newStore(t)
 	stubAlive(t, func(int) bool { return true })
-	tests := []struct{ owner, stem string }{
-		{"user/process", "user_process"},
-		{"user..process", "user..process"},
-		{`user\process`, "user_process"},
-		{"user!@#process", "user___process"},
+	for _, owner := range []string{"user/process", `user\process`, "user!@#process", "user process"} {
+		if err := s.AddHold(Hold{Owner: owner, PID: 1}); err == nil {
+			t.Errorf("AddHold accepted owner %q", owner)
+		}
 	}
-	for _, tt := range tests {
-		if err := s.AddHold(Hold{Owner: tt.owner, PID: 1}); err != nil {
-			t.Fatalf("AddHold(%q): %v", tt.owner, err)
-		}
-		holds, err := s.HoldsIncludingStale()
-		if err != nil {
-			t.Fatal(err)
-		}
-		found := false
-		for _, h := range holds {
-			if h.Owner == tt.stem {
-				found = true
-			}
-		}
-		if !found {
-			t.Errorf("owner %q was not stored as %q", tt.owner, tt.stem)
-		}
+	if _, err := os.Stat(filepath.Join(s.holdsDir, "user_process.json")); !errors.Is(err, os.ErrNotExist) {
+		t.Error("a rejected owner still produced a file")
 	}
 }
 
@@ -445,14 +429,14 @@ func TestRemoveHold(t *testing.T) {
 func TestRunLogNamesAndAppends(t *testing.T) {
 	s := newStore(t)
 	at := time.Date(2026, 11, 15, 23, 30, 0, 0, time.UTC)
-	path, err := s.RunLog("offsite repair", at, []byte("first\n"))
+	path, err := s.RunLog("offsite-repair", at, []byte("first\n"))
 	if err != nil {
 		t.Fatalf("RunLog: %v", err)
 	}
-	if want := filepath.Join(s.runsDir, "offsite_repair-20261115.log"); path != want {
+	if want := filepath.Join(s.runsDir, "offsite-repair-20261115.log"); path != want {
 		t.Errorf("path %q, want %q", path, want)
 	}
-	if _, err := s.RunLog("offsite repair", at.Add(time.Minute), []byte("second\n")); err != nil {
+	if _, err := s.RunLog("offsite-repair", at.Add(time.Minute), []byte("second\n")); err != nil {
 		t.Fatalf("second RunLog: %v", err)
 	}
 	data, err := os.ReadFile(path)
@@ -462,7 +446,7 @@ func TestRunLogNamesAndAppends(t *testing.T) {
 	if string(data) != "first\nsecond\n" {
 		t.Errorf("log body %q", data)
 	}
-	if _, err := s.RunLog("offsite repair", at.AddDate(0, 0, 1), []byte("x")); err != nil {
+	if _, err := s.RunLog("offsite-repair", at.AddDate(0, 0, 1), []byte("x")); err != nil {
 		t.Fatal(err)
 	}
 	entries, err := os.ReadDir(s.runsDir)
@@ -494,7 +478,7 @@ func TestRunLogCap(t *testing.T) {
 
 func TestRunLogRejectsUnusableItem(t *testing.T) {
 	s := newStore(t)
-	for _, item := range []string{"", ".", ".."} {
+	for _, item := range []string{"", ".", "..", "a/b", "a b"} {
 		if _, err := s.RunLog(item, time.Now(), []byte("x")); err == nil {
 			t.Errorf("RunLog accepted item %q", item)
 		}
@@ -581,18 +565,173 @@ func TestRunLogDay(t *testing.T) {
 	}
 }
 
-func TestSanitizeOwner(t *testing.T) {
-	tests := map[string]string{
-		"plain":     "plain",
-		"a/b":       "a_b",
-		"../escape": ".._escape",
-		"a b":       "a_b",
-		"keep._-":   "keep._-",
-		"üñïcode":   "___code",
-	}
-	for in, want := range tests {
-		if got := sanitizeOwner(in); got != want {
-			t.Errorf("sanitizeOwner(%q) = %q, want %q", in, got, want)
+func TestValidSlug(t *testing.T) {
+	valid := []string{"plain", "offsite", "branch-chore-land-prs", "pid-1234", "keep._-", "a..b"}
+	for _, s := range valid {
+		if !ValidSlug(s) {
+			t.Errorf("ValidSlug(%q) = false, want true", s)
 		}
+	}
+	invalid := []string{"", ".", "..", "a/b", "a b", `a\b`, "a: b", "../escape", "-leading", "üñïcode"}
+	for _, s := range invalid {
+		if ValidSlug(s) {
+			t.Errorf("ValidSlug(%q) = true, want false", s)
+		}
+	}
+}
+
+func TestLockIsExclusiveBetweenStores(t *testing.T) {
+	dir := t.TempDir()
+	a, err := Open(dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	b, err := Open(dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := a.Lock(); err != nil {
+		t.Fatalf("first Lock: %v", err)
+	}
+	if err := b.Lock(); !errors.Is(err, ErrLocked) {
+		t.Fatalf("second Lock = %v, want ErrLocked", err)
+	}
+	if err := a.Unlock(); err != nil {
+		t.Fatalf("Unlock: %v", err)
+	}
+	if err := b.Lock(); err != nil {
+		t.Fatalf("Lock after release: %v", err)
+	}
+	if err := b.Unlock(); err != nil {
+		t.Fatal(err)
+	}
+}
+
+func TestLockIsNotReentrant(t *testing.T) {
+	dir := t.TempDir()
+	a, err := Open(dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := a.Lock(); err != nil {
+		t.Fatal(err)
+	}
+	if err := a.Lock(); !errors.Is(err, ErrLocked) {
+		t.Fatalf("second Lock on one store = %v, want ErrLocked", err)
+	}
+	if err := a.Unlock(); err != nil {
+		t.Fatal(err)
+	}
+	if err := a.Lock(); err != nil {
+		t.Fatalf("Lock after Unlock: %v", err)
+	}
+	a.Unlock()
+}
+
+func TestUnlocksWhenNotHeld(t *testing.T) {
+	s := newStore(t)
+	if err := s.Unlock(); err != nil {
+		t.Errorf("Unlock without Lock: %v", err)
+	}
+}
+
+func TestHoldSurvivesEPERM(t *testing.T) {
+	s := newStore(t)
+	previous := processAlive
+	processAlive = func(int) bool { return true }
+	t.Cleanup(func() { processAlive = previous })
+	if err := s.AddHold(Hold{Owner: "pid-1", PID: 1}); err != nil {
+		t.Fatal(err)
+	}
+	holds, err := s.Holds()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(holds) != 1 {
+		t.Fatalf("got %d holds, want the hold kept", len(holds))
+	}
+}
+
+func TestHoldDiesWhenThePIDWasReused(t *testing.T) {
+	s := newStore(t)
+	previousAlive, previousStart := processAlive, processStart
+	processAlive = func(int) bool { return true }
+	processStart = func(int) (uint64, bool) { return 900, true }
+	t.Cleanup(func() { processAlive, processStart = previousAlive, previousStart })
+
+	if err := s.AddHold(Hold{Owner: "pid-2", PID: 2, StartTicks: 100}); err != nil {
+		t.Fatal(err)
+	}
+	holds, err := s.Holds()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(holds) != 0 {
+		t.Fatalf("holds %+v, want the reused pid treated as stale", holds)
+	}
+}
+
+func TestHoldIsKeptWhenTheStartTimeCannotBeRead(t *testing.T) {
+	s := newStore(t)
+	previousAlive, previousStart := processAlive, processStart
+	processAlive = func(int) bool { return true }
+	processStart = func(int) (uint64, bool) { return 0, false }
+	t.Cleanup(func() { processAlive, processStart = previousAlive, previousStart })
+
+	if err := s.AddHold(Hold{Owner: "pid-3", PID: 3, StartTicks: 100}); err != nil {
+		t.Fatal(err)
+	}
+	holds, err := s.Holds()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(holds) != 1 {
+		t.Fatalf("holds %+v, want the hold kept when /proc cannot be read", holds)
+	}
+}
+
+func TestDeferralsAreNewestPerItem(t *testing.T) {
+	s := newStore(t)
+	base := time.Date(2026, 11, 15, 12, 0, 0, 0, time.UTC)
+	for _, v := range []Verdict{
+		{ID: "offsite", State: "not-live", At: base},
+		{ID: "offsite", Kind: KindDefer, At: base, Until: base.Add(time.Hour)},
+		{ID: "offsite", Kind: KindDefer, At: base.Add(time.Minute), Until: base.Add(3 * time.Hour)},
+		{ID: "backup", State: "live", At: base},
+	} {
+		if err := s.AppendVerdict(v); err != nil {
+			t.Fatal(err)
+		}
+	}
+	deferred, err := s.Deferrals()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(deferred) != 1 {
+		t.Fatalf("got %d deferrals, want 1: %+v", len(deferred), deferred)
+	}
+	if got := deferred["offsite"].Until; !got.Equal(base.Add(3 * time.Hour)) {
+		t.Errorf("until %v, want the newest deferral", got)
+	}
+	if _, ok := deferred["backup"]; ok {
+		t.Error("a live measurement was treated as a deferral")
+	}
+}
+
+func TestParseStartTicks(t *testing.T) {
+	// A comm field with spaces and parentheses must not shift the field index.
+	stat := "4242 (a (weird) name) S 1 2 3 4 5 6 7 8 9 10 11 12 13 14 15 16 17 18 123456 20 21\n"
+	ticks, ok := parseStartTicks([]byte(stat))
+	if !ok {
+		t.Fatal("parseStartTicks failed")
+	}
+	if ticks != 123456 {
+		t.Errorf("ticks %d, want 123456", ticks)
+	}
+	if _, ok := parseStartTicks([]byte("garbage")); ok {
+		t.Error("parseStartTicks accepted garbage")
+	}
+	if _, ok := parseStartTicks([]byte("1 (short) S 1 2\n")); ok {
+		t.Error("parseStartTicks accepted a truncated stat line")
 	}
 }

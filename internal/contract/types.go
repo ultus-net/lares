@@ -25,10 +25,17 @@ type Record struct {
 	Fix    string `json:"fix"`
 }
 
-// IsFinding reports whether the record needs attention, which is every state
-// except live.
+// IsFinding reports whether the record is a finding: not-live or stale. The
+// CLI uses this for its exit code, so an unknown record does not fail a measure.
 func (r Record) IsFinding() bool {
 	return r.State == NotLive || r.State == Stale
+}
+
+// NeedsAttention reports whether the controller must queue the record, which is
+// every state except live. An unknown measurement is queued without a repair,
+// because no check proved the item healthy.
+func (r Record) NeedsAttention() bool {
+	return r.State != Live
 }
 
 // IsSummary reports whether the record is the trailing summary.

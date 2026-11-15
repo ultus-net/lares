@@ -67,7 +67,9 @@ func TestInstallWritesEveryFile(t *testing.T) {
 		filepath.Join(home, ".config", "systemd", "user", "lares.timer"),
 		filepath.Join(home, ".config", "lares", "config.toml"),
 		filepath.Join(home, ".config", "lares", "adapters.toml"),
-		filepath.Join(home, ".config", "lares", "lares.sudoers"),
+	}
+	if _, err := os.Stat(filepath.Join(home, ".config", "lares", "lares.sudoers")); !os.IsNotExist(err) {
+		t.Fatalf("installer wrote a sudoers file: %v", err)
 	}
 	if len(written) != len(want) {
 		t.Fatalf("wrote %d files, want %d: %v", len(written), len(want), written)
@@ -103,7 +105,6 @@ func TestInstallModes(t *testing.T) {
 		written[2]: 0o644,
 		written[3]: 0o600,
 		written[4]: 0o600,
-		written[5]: 0o644,
 	}
 	for path, mode := range want {
 		info, err := os.Stat(path)
@@ -204,9 +205,11 @@ func TestInstallRejectsMissingBinary(t *testing.T) {
 func TestConfigTOMLRoundTrips(t *testing.T) {
 	home := t.TempDir()
 	cfg := testConfig(t, home)
+	cfg.RepoDir = "/home/tester/dotfiles"
 	cfg.AdapterOverride = "arch"
 	cfg.WindowStart = "23:30"
 	cfg.WindowEnd = "01:15"
+	cfg.RebootFromPass = false
 	body := ConfigTOML(cfg)
 
 	path := filepath.Join(t.TempDir(), "config.toml")
@@ -219,6 +222,12 @@ func TestConfigTOMLRoundTrips(t *testing.T) {
 	}
 	if got.StateDir != cfg.StateDir || got.ConfigDir != cfg.ConfigDir {
 		t.Errorf("dirs %q %q, want %q %q", got.StateDir, got.ConfigDir, cfg.StateDir, cfg.ConfigDir)
+	}
+	if got.RepoDir != "/home/tester/dotfiles" {
+		t.Errorf("repo dir %q", got.RepoDir)
+	}
+	if got.RebootFromPass {
+		t.Error("reboot_from_pass = false did not survive the round trip")
 	}
 	if got.WindowStart != "23:30" || got.WindowEnd != "01:15" {
 		t.Errorf("window %+v", got.Window)
@@ -270,16 +279,20 @@ func TestAdaptersTOMLEmptyIsHeaderOnly(t *testing.T) {
 }
 
 func TestServiceUnit(t *testing.T) {
-	body := ServiceUnit()
+	body := ServiceUnit("/home/tester/dotfiles")
 	for _, want := range []string{
 		"Type=oneshot",
 		"ExecStart=%h/.local/bin/lares pass",
 		"Nice=10",
 		"IOSchedulingClass=idle",
+		"WorkingDirectory=/home/tester/dotfiles",
 	} {
 		if !strings.Contains(body, want) {
 			t.Errorf("service unit missing %q:\n%s", want, body)
 		}
+	}
+	if strings.Contains(ServiceUnit(""), "WorkingDirectory") {
+		t.Error("an empty repo dir still wrote WorkingDirectory")
 	}
 }
 
@@ -297,43 +310,30 @@ func TestTimerUnit(t *testing.T) {
 	}
 }
 
-func TestSudoersNamesEachStageProgramOnce(t *testing.T) {
-	text := SudoersText(testAdapters())
-	for _, program := range []string{"patch-train-update", "rpm-ostree"} {
-		if got := strings.Count(text, program); got != 1 {
-			t.Errorf("%s appears %d times, want 1:\n%s", program, got, text)
+func TestInstallShipsDefaultAdapters(t *testing.T) {
+	home := t.TempDir()
+	opts := Options{HomeDir: home, BinaryPath: sourceBinary(t), Config: testConfig(t, home)}
+	if _, err := Install(opts); err != nil {
+		t.Fatalf("Install: %v", err)
+	}
+	path := filepath.Join(home, ".config", "lares", "adapters.toml")
+	table, err := adapter.Load(path)
+	if err != nil {
+		t.Fatalf("adapter.Load: %v", err)
+	}
+	for _, family := range []adapter.Family{adapter.Arch, adapter.FedoraAtomic, adapter.Bootc} {
+		if _, ok := table[family]; !ok {
+			t.Errorf("shipped adapters.toml has no %q section", family)
 		}
-	}
-	if !strings.Contains(text, "NOPASSWD") {
-		t.Errorf("sudoers text has no NOPASSWD line:\n%s", text)
-	}
-	if !strings.Contains(text, "Cmnd_Alias LARES_STAGE") {
-		t.Errorf("sudoers text has no command alias:\n%s", text)
-	}
-}
-
-func TestSudoersWithNoAdapters(t *testing.T) {
-	text := SudoersText(nil)
-	if strings.Contains(text, "NOPASSWD") {
-		t.Errorf("empty adapter table still grants a command:\n%s", text)
-	}
-	if !strings.Contains(text, "no command is granted") {
-		t.Errorf("text does not say nothing is granted:\n%s", text)
 	}
 }
 
 func TestNextSteps(t *testing.T) {
-	steps := NextSteps("/home/tester")
-	if len(steps) != 2 {
-		t.Fatalf("got %d steps, want 2: %v", len(steps), steps)
+	steps := NextSteps()
+	if len(steps) != 1 {
+		t.Fatalf("got %d steps, want 1: %v", len(steps), steps)
 	}
-	if !strings.Contains(steps[0], "/home/tester/.config/lares/lares.sudoers") {
-		t.Errorf("first step %q does not name the sudoers file", steps[0])
-	}
-	if !strings.HasPrefix(steps[0], "sudo install -m 0440") {
-		t.Errorf("first step %q is not a sudo install", steps[0])
-	}
-	if !strings.HasPrefix(steps[1], "loginctl enable-linger") {
-		t.Errorf("second step %q is not enable-linger", steps[1])
+	if !strings.HasPrefix(steps[0], "loginctl enable-linger") {
+		t.Errorf("step %q is not enable-linger", steps[0])
 	}
 }

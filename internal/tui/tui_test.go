@@ -29,6 +29,8 @@ func newModel(t *testing.T, records ...[]contract.Record) Model {
 	cfg := config.Default()
 	cfg.StateDir = store.Dir()
 	cfg.ConfigDir = store.Dir()
+	// The punch list is not the reboot gate, so a pass here never queues one.
+	cfg.RebootFromPass = false
 	if err := cfg.Validate(); err != nil {
 		t.Fatalf("Validate: %v", err)
 	}
@@ -54,7 +56,7 @@ func newModel(t *testing.T, records ...[]contract.Record) Model {
 		Sleep:    func(context.Context, time.Duration) error { return nil },
 		Session:  func(context.Context) (bool, error) { return false, nil },
 		Train:    func(context.Context) (bool, error) { return false, nil },
-		Agents:   func() []string { return nil },
+		Agents:   func() ([]reconcile.Agent, error) { return nil, nil },
 		Activate: func(context.Context, []string) error { return nil },
 	})
 	if err != nil {
@@ -188,6 +190,53 @@ func TestDeferMovesNextAttempt(t *testing.T) {
 	}
 	if queue.Items[0].Term != "deferred" {
 		t.Errorf("term %q, want deferred", queue.Items[0].Term)
+	}
+}
+
+func TestDeferWritesAVerdict(t *testing.T) {
+	m := newModel(t, []contract.Record{
+		{ID: "offsite", State: contract.NotLive, Detail: "no repo"},
+		{ID: contract.SummaryID, State: contract.NotLive},
+	})
+	if _, err := m.engine.Pass(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	if err := m.reload(); err != nil {
+		t.Fatal(err)
+	}
+	updated, _ := m.Update(key('d'))
+	m = updated.(Model)
+
+	deferred, err := m.store.Deferrals()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, ok := deferred["offsite"]; !ok {
+		t.Fatal("the deferral was not recorded in the verdict log")
+	}
+}
+
+func TestActionForNamesOnlyImplementedKeys(t *testing.T) {
+	if got := actionFor(reconcile.RebootID); got != "[r]eboot" {
+		t.Errorf("reboot action %q", got)
+	}
+	for _, id := range []string{"offsite", "branch-x", "patch-train", "backup"} {
+		if got := actionFor(id); got != "[d]efer" {
+			t.Errorf("action for %q is %q, want [d]efer", id, got)
+		}
+	}
+}
+
+func TestUnknownVerdictIsARow(t *testing.T) {
+	status := reconcile.Status{Verdicts: map[string]state.Verdict{
+		"backup": {ID: "backup", State: "unknown", Detail: "cannot measure", At: base},
+	}}
+	rows := rowsFrom(status, base)
+	if len(rows) != 1 || rows[0].ID != "backup" {
+		t.Fatalf("rows %+v, want the unknown verdict shown", rows)
+	}
+	if rows[0].State != contract.Unknown {
+		t.Errorf("state %q, want unknown", rows[0].State)
 	}
 }
 
