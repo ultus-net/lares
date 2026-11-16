@@ -469,7 +469,7 @@ func (e *Engine) persistItem(item state.Item) error {
 	return err
 }
 
-// EscalateAfterAttempts is the number of failed retryable pushes after which
+// EscalateAfterAttempts is the number of failed non-terminal pushes after which
 // an unpushed backup outranks the rest of the punch list.
 const EscalateAfterAttempts = 3
 

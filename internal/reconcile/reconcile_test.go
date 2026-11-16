@@ -276,15 +276,6 @@ func backupStale() []contract.Record {
 	}
 }
 
-// backupDrift is one unsafe backup finding: the remote diverged or the target
-// is protected, so no repair runs.
-func backupDrift() []contract.Record {
-	return []contract.Record{
-		rec("backup-demo", contract.NotLive, "push"),
-		summary(contract.NotLive),
-	}
-}
-
 // pushRepairer fails every repair with a classified push error and counts the
 // calls, so a test can prove a terminal failure is not retried.
 type pushRepairer struct {
@@ -350,11 +341,10 @@ func TestPassNeverEscalatesATerminalPush(t *testing.T) {
 	}
 }
 
-func TestPassQueuesADivergedBackupWithoutEscalating(t *testing.T) {
-	h := newHarness(t, backupDrift())
-	// fakeRepairer marks backup-demo unsafe, so no push runs. A diverged
-	// remote is terminal: the item must stay needs-operator and its attempts
-	// must not move, even after more passes than the escalation threshold.
+func TestPassQueuesAnUnsafeBackupWithoutEscalating(t *testing.T) {
+	h := newHarness(t, backupStale())
+	// fakeRepairer marks backup-demo unsafe, so no push runs. An unsafe
+	// finding must not accrue attempts or escalate: only a failed repair can.
 	for i := 0; i < EscalateAfterAttempts+1; i++ {
 		if _, err := h.engine.Pass(context.Background()); err != nil {
 			t.Fatalf("pass %d: %v", i, err)

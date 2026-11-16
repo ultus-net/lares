@@ -23,8 +23,11 @@ All notable changes to this project are recorded here. The format follows
   ref, and `HEAD` agree after a fetch, and ahead and behind are both zero; a
   push exit code alone is not evidence.
 - `backup-<name>` checks and the `push` repair. The push never forces, refuses
-  the remote default branch resolved with `git ls-remote --symref`, and never
-  pushes tags, notes, or refs outside the backup namespace.
+  the remote default branch resolved with `git ls-remote --symref`, overrides
+  ambient `push.followTags`, and never pushes tags, notes, or refs outside the
+  backup namespace. An existing local backup branch moves only forward, an empty
+  remote can receive its first backup, and an unreadable checkout reports
+  `unknown` rather than a false backup finding.
 - Tests for the backup refusals: default-branch target, a diverged remote, a
   rejected push, a credential file that is never read, branch reuse, and
   bilateral convergence.

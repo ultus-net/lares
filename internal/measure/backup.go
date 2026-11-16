@@ -360,15 +360,20 @@ func (e *Engine) runBounded(ctx context.Context, dir string, argv []string, time
 	return e.run(ctx, dir, argv)
 }
 
-// pushState maps a read failure to a record state. A network fault is stale,
-// not unknown: the repair re-checks every precondition and never forces, so the
-// next pass may retry with backoff. Every terminal failure needs a person.
+// pushState maps a classified git failure to a record state. A network fault is
+// stale so the next pass may retry with backoff. A terminal failure is not-live:
+// it needs a person. An unclassified failure is unknown, because lares cannot
+// prove a backup state from it.
 func pushState(stage string, err error) (contract.State, string, error) {
 	pe := classifyGitError(stage, err)
-	if pe.Retryable() {
+	switch {
+	case pe.Retryable():
 		return contract.Stale, pe.Error(), nil
+	case pe.Kind == "other":
+		return contract.Unknown, pe.Error(), nil
+	default:
+		return contract.NotLive, pe.Error(), nil
 	}
-	return contract.NotLive, pe.Error(), nil
 }
 
 // classifyGitError names the failure so the queue can retry a network fault and
