@@ -153,6 +153,7 @@ func ConfigTOML(cfg config.Config) string {
 	fmt.Fprintf(&b, "window_start = %q\n", cfg.WindowStart)
 	fmt.Fprintf(&b, "window_end = %q\n", cfg.WindowEnd)
 	fmt.Fprintf(&b, "resync = %q\n", cfg.ResyncText)
+	fmt.Fprintf(&b, "notify = %q\n", cfg.Notify)
 	fmt.Fprintf(&b, "reboot_from_pass = %t\n", cfg.RebootFromPass)
 	if cfg.AdapterOverride != "" {
 		fmt.Fprintf(&b, "adapter_override = %q\n", cfg.AdapterOverride)

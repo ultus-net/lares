@@ -209,6 +209,7 @@ func TestConfigTOMLRoundTrips(t *testing.T) {
 	cfg.AdapterOverride = "arch"
 	cfg.WindowStart = "23:30"
 	cfg.WindowEnd = "01:15"
+	cfg.Notify = config.NotifyStdout
 	cfg.RebootFromPass = false
 	body := ConfigTOML(cfg)
 
@@ -234,6 +235,9 @@ func TestConfigTOMLRoundTrips(t *testing.T) {
 	}
 	if got.AdapterOverride != "arch" {
 		t.Errorf("override %q", got.AdapterOverride)
+	}
+	if got.Notify != config.NotifyStdout {
+		t.Errorf("notify %q, want %q", got.Notify, config.NotifyStdout)
 	}
 	if strings.Join(got.AuditCommand, " ") != strings.Join(cfg.AuditCommand, " ") {
 		t.Errorf("audit command %v, want %v", got.AuditCommand, cfg.AuditCommand)

@@ -718,6 +718,70 @@ func TestDeferralsAreNewestPerItem(t *testing.T) {
 	}
 }
 
+func TestNotifiedRoundTrips(t *testing.T) {
+	s := newStore(t)
+	keys, err := s.Notified()
+	if err != nil {
+		t.Fatalf("Notified on a missing file: %v", err)
+	}
+	if len(keys) != 0 {
+		t.Errorf("missing file gave %v, want empty", keys)
+	}
+
+	want := map[string]bool{"offsite/not-live/git push failed": true, "reboot/blocked/hold": true}
+	if err := s.SaveNotified(want); err != nil {
+		t.Fatalf("SaveNotified: %v", err)
+	}
+	got, err := s.Notified()
+	if err != nil {
+		t.Fatalf("Notified: %v", err)
+	}
+	if len(got) != len(want) {
+		t.Fatalf("read %v, want %v", got, want)
+	}
+	for key := range want {
+		if !got[key] {
+			t.Errorf("key %q missing", key)
+		}
+	}
+
+	data, err := os.ReadFile(filepath.Join(s.Dir(), "notified.json"))
+	if err != nil {
+		t.Fatalf("read notified.json: %v", err)
+	}
+	if !strings.HasSuffix(string(data), "\n") {
+		t.Error("notified.json has no trailing newline")
+	}
+}
+
+func TestNotifiedQuarantinesACorruptFile(t *testing.T) {
+	s := newStore(t)
+	path := filepath.Join(s.Dir(), "notified.json")
+	if err := os.WriteFile(path, []byte("not json"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	keys, err := s.Notified()
+	if err != nil {
+		t.Fatalf("Notified on a corrupt file: %v", err)
+	}
+	if len(keys) != 0 {
+		t.Errorf("corrupt file gave %v, want empty", keys)
+	}
+	entries, err := os.ReadDir(s.Dir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	quarantined := false
+	for _, entry := range entries {
+		if strings.HasPrefix(entry.Name(), "notified.json.corrupt-") {
+			quarantined = true
+		}
+	}
+	if !quarantined {
+		t.Error("a corrupt notified file was not quarantined")
+	}
+}
+
 func TestParseStartTicks(t *testing.T) {
 	// A comm field with spaces and parentheses must not shift the field index.
 	stat := "4242 (a (weird) name) S 1 2 3 4 5 6 7 8 9 10 11 12 13 14 15 16 17 18 123456 20 21\n"

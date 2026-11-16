@@ -17,6 +17,8 @@ interval.
    only when a verification names the item and says `live`. A missing record and
    an `unknown` record both leave the item queued.
 6. Save the queue, then evaluate the reboot gate when `reboot_from_pass` is on.
+7. Surface each finding that is still queued, once, to the journal and, when a
+   session exists, to the desktop.
 
 A finding the safe set does not cover is queued and never attempted. The queue
 is derived state: an item that stops being a finding leaves the queue, and its
@@ -134,6 +136,42 @@ so no repair can start between the check and the activation.
 Activation comes from `adapters.toml`, so Arch uses `omarchy-system reboot`
 (closes windows first) and Fedora atomic or bootc reboots plainly.
 
+## Notifications
+
+A timer pass runs with nobody watching, so a new finding also goes to a person.
+A pass surfaces each new finding once: every item left in the queue, and a
+blocked reboot.
+
+```toml
+notify = "auto"   # auto | desktop | stdout | off
+```
+
+| Mode | stdout | `notify-send`, when a session exists |
+| --- | --- | --- |
+| `auto` (default) | yes | yes |
+| `desktop` | no | yes |
+| `stdout` | yes | no |
+| `off` | no | no |
+
+`auto` is the default. The journal keeps every notice, and a desktop session
+also gets a notification. On a headless host the journal line is the record.
+
+Dedupe is by item id, state, and detail, stored in `notified.json` under the
+state lock. An identical failure is surfaced once. A changed detail is a new
+finding and is surfaced again. A finding that clears and returns is surfaced
+again, because its key leaves the file when it stops being a finding. A blocked
+reboot is keyed by its term, and the unclaimed process names are part of the
+message, not the key.
+
+A desktop send that fails never fails the pass. The line was still written, and
+the failure is reported on stderr, so a host without `notify-send` keeps
+converging and the journal still carries the record. A key is recorded once
+anything reached the person, so that failure is not re-printed on the next pass.
+In `desktop` mode nothing reached the person, so the key is not recorded and the
+next pass retries the send. The session check is the reboot gate's check:
+another login, Omarchy's stay-awake marker, or a `block` or `block-weak`
+inhibitor lock means a session exists.
+
 ## State
 
 ```text
@@ -141,6 +179,7 @@ Activation comes from `adapters.toml`, so Arch uses `omarchy-system reboot`
 ├── verdicts.jsonl        append-only, 90 day retention
 ├── queue.json            the queue
 ├── queue.json.bak        the previous generation
+├── notified.json         the findings already surfaced to a person
 ├── holds/                one file per live hold
 ├── runs/                 one log per item per UTC day, 30 day retention, 10 MiB cap
 └── lock                  the interprocess lock, flock on a file
@@ -154,6 +193,10 @@ hold or deferral write each take it.
 directory fsync. A reader that finds a corrupt primary renames it to
 `queue.json.corrupt-<unix-nano>`, loads the backup, and reports `recovered`.
 When both files are unusable the read fails rather than starting empty.
+
+`notified.json` is replaced the same way. A corrupt file is renamed to
+`notified.json.corrupt-<unix-nano>` and read as empty, so the damage costs one
+repeated notice instead of a failed pass.
 
 ## Install
 
@@ -224,9 +267,10 @@ item is a standing reminder to stage an update, not a one-shot task. Defer it
 when an update is not wanted.
 
 `config.toml`'s `adapter_override` names a section when detection is wrong.
-`repo_dir` is the checkout that holds the probe. `reboot_from_pass` (default
-true) decides whether a pass evaluates the reboot gate, and it exists so a host
-that reboots by hand can turn the gate off without editing the binary.
+`repo_dir` is the checkout that holds the probe. `notify` picks the notification
+channel and defaults to `auto`. `reboot_from_pass` (default true) decides
+whether a pass evaluates the reboot gate, and it exists so a host that reboots
+by hand can turn the gate off without editing the binary.
 
 ## Troubleshooting
 

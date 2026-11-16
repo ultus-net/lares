@@ -62,6 +62,7 @@ type Options struct {
 	Staged   func(ctx context.Context) (bool, error)
 	Agents   func() ([]Agent, error)
 	Activate func(ctx context.Context, argv []string) error
+	Notify   func(ctx context.Context, title, body string, urgent bool) error
 }
 
 // Engine reconciles one host.
@@ -81,6 +82,7 @@ type Engine struct {
 	staged   func(ctx context.Context) (bool, error)
 	agents   func() ([]Agent, error)
 	activate func(ctx context.Context, argv []string) error
+	notify   func(ctx context.Context, title, body string, urgent bool) error
 }
 
 // Result reports what one pass did.
@@ -91,6 +93,10 @@ type Result struct {
 	Escalated []string
 	Skipped   []string
 	Reboot    RebootVerdict
+	// Notices are the lines this pass surfaced for the journal.
+	Notices []string
+	// NotifyFailed names a delivery that failed. A pass never fails for it.
+	NotifyFailed []string
 }
 
 // New builds an Engine, replacing the zero fields in opts with host defaults.
@@ -117,6 +123,7 @@ func New(opts Options) (*Engine, error) {
 		staged:   opts.Staged,
 		agents:   opts.Agents,
 		activate: opts.Activate,
+		notify:   opts.Notify,
 	}
 	if e.now == nil {
 		e.now = time.Now
@@ -151,6 +158,9 @@ func New(opts Options) (*Engine, error) {
 		e.activate = func(ctx context.Context, argv []string) error {
 			return exec.CommandContext(ctx, argv[0], argv[1:]...).Run()
 		}
+	}
+	if e.notify == nil {
+		e.notify = defaultNotify
 	}
 	return e, nil
 }
@@ -319,6 +329,12 @@ func (e *Engine) Pass(ctx context.Context) (Result, error) {
 		}
 		result.Reboot = verdict
 	}
+
+	notices, failed, err := e.notifyFindings(ctx, records, next.Items, result.Reboot)
+	if err != nil {
+		return result, fmt.Errorf("notify: %w", err)
+	}
+	result.Notices, result.NotifyFailed = notices, failed
 	return result, nil
 }
 

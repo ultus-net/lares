@@ -50,6 +50,14 @@ All notable changes to this project are recorded here. The format follows
   and a failed read or an unparsable line blocks instead of reporting idle. A
   host without the command fails the read, so it blocks rather than reading as
   idle.
+- A notification pass step. Each new finding, meaning every item left in the
+  queue plus a blocked reboot, is surfaced once: printed for the journal in
+  `auto` or `stdout` mode, and sent with `notify-send` when a session exists in
+  `auto` or `desktop` mode. `notify` in `config.toml` picks the mode and
+  defaults to `auto`. Dedupe is keyed by item id, state, and detail in
+  `notified.json`, written under the state lock, so a repeated identical failure
+  is silent and a changed detail is surfaced again. A desktop failure is
+  reported on stderr and never fails the pass.
 
 ### Changed
 

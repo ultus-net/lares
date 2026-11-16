@@ -309,6 +309,12 @@ func (a *app) pass(ctx context.Context) {
 	fmt.Printf("converged=%d queued=%d escalated=%d waiting=%d\n",
 		len(result.Converged), len(result.Queued), len(result.Escalated), len(result.Skipped))
 	printReboot(result.Reboot)
+	for _, notice := range result.Notices {
+		fmt.Println(notice)
+	}
+	for _, failure := range result.NotifyFailed {
+		fmt.Fprintf(os.Stderr, "notify: %s\n", failure)
+	}
 	if anyFinding(result.Measured) {
 		os.Exit(1)
 	}

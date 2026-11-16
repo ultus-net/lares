@@ -96,6 +96,7 @@ func (c *cli) writeConfig(t *testing.T) {
 state_dir = %q
 config_dir = %q
 repo_dir = %q
+notify = "stdout"
 reboot_from_pass = false
 `, c.probe, c.state, c.configDir, c.repoDir)
 	if err := os.WriteFile(c.config, []byte(body), 0o600); err != nil {
@@ -242,6 +243,27 @@ func TestMeasureJSONAndExitOne(t *testing.T) {
 	}
 	if verdicts[0].Fix != "install/offsite-oauth-wizard.sh" {
 		t.Errorf("verdict fix %q, want the probe's command", verdicts[0].Fix)
+	}
+}
+
+func TestPassPrintsTheNoticeOnce(t *testing.T) {
+	c := newCLI(t)
+	c.writeProbe(t, `printf '%s\n' '{"id":"offsite","state":"not-live","detail":"no repo","fix":"install/offsite-oauth-wizard.sh"}' '{"id":"summary","state":"not-live","detail":"1 finding","fix":""}'`)
+
+	stdout, stderr, code := c.run(t, "--config", c.config, "pass")
+	if code != 1 {
+		t.Fatalf("exit %d, want 1, stderr %q", code, stderr)
+	}
+	if !strings.Contains(stdout, "lares: offsite not-live: no repo") {
+		t.Errorf("stdout does not carry the notice:\n%s", stdout)
+	}
+
+	again, _, code := c.run(t, "--config", c.config, "pass")
+	if code != 1 {
+		t.Fatalf("second pass exit %d, want 1", code)
+	}
+	if strings.Contains(again, "lares: offsite") {
+		t.Errorf("second pass repeated the notice:\n%s", again)
 	}
 }
 

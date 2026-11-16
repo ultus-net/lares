@@ -30,15 +30,26 @@ type harness struct {
 	runs        [][]string
 	sleeps      []time.Duration
 	activations [][]string
+	notified    []sentNotice
 	session     bool
 	train       bool
 }
 
+// sentNotice is one desktop notification the engine asked for.
+type sentNotice struct {
+	Title  string
+	Body   string
+	Urgent bool
+}
+
 // harnessOptions names what a test overrides in the default harness.
 type harnessOptions struct {
-	family   adapter.Family
-	adapters map[adapter.Family]adapter.Adapter
-	staged   func(context.Context) (bool, error)
+	family    adapter.Family
+	adapters  map[adapter.Family]adapter.Adapter
+	staged    func(context.Context) (bool, error)
+	notify    string
+	notifyErr error
+	reboot    bool
 }
 
 // newHarness builds an engine whose probe returns the scripted measurements in
@@ -68,8 +79,15 @@ func newHarnessWith(t *testing.T, opts harnessOptions, script ...[]contract.Reco
 	}
 	h := &harness{store: store, stateDir: dir, repoDir: dir, measures: script}
 	index := 0
+	cfg := testConfig(dir, opts.reboot)
+	if opts.notify != "" {
+		cfg.Notify = opts.notify
+		if err := cfg.Validate(); err != nil {
+			t.Fatalf("config: %v", err)
+		}
+	}
 	engine, err := New(Options{
-		Config:   testConfig(dir, false),
+		Config:   cfg,
 		Store:    store,
 		Family:   opts.family,
 		Adapters: opts.adapters,
@@ -101,6 +119,10 @@ func newHarnessWith(t *testing.T, opts harnessOptions, script ...[]contract.Reco
 		Activate: func(_ context.Context, argv []string) error {
 			h.activations = append(h.activations, argv)
 			return nil
+		},
+		Notify: func(_ context.Context, title, body string, urgent bool) error {
+			h.notified = append(h.notified, sentNotice{Title: title, Body: body, Urgent: urgent})
+			return opts.notifyErr
 		},
 	})
 	if err != nil {
