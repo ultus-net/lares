@@ -6,9 +6,9 @@
 // in-process repair. A record from an external probe is always queued, because
 // lares does not run a repair it cannot prove.
 //
-// Every side effect is injectable: measure, repair, sleep, read the session
-// state, ask the update-train lock, list agent processes, and activate a reboot.
-// Tests drive the whole loop without touching the host.
+// Every side effect is injectable: measure, repair, sleep, write the run log,
+// read the session state, ask the update-train lock, list agent processes, and
+// activate a reboot. Tests drive the whole loop without touching the host.
 package reconcile
 
 import (
@@ -63,6 +63,7 @@ type Options struct {
 	Measure  func(ctx context.Context) ([]contract.Record, error)
 	Repairer Repairer
 	Sleep    func(ctx context.Context, d time.Duration) error
+	RunLog   func(item string, at time.Time, body []byte) (string, error)
 	Session  func(ctx context.Context) (bool, error)
 	Train    func(ctx context.Context) (bool, error)
 	Staged   func(ctx context.Context) (bool, error)
@@ -82,6 +83,7 @@ type Engine struct {
 	measure  func(ctx context.Context) ([]contract.Record, error)
 	repairer Repairer
 	sleep    func(ctx context.Context, d time.Duration) error
+	runLog   func(item string, at time.Time, body []byte) (string, error)
 	session  func(ctx context.Context) (bool, error)
 	train    func(ctx context.Context) (bool, error)
 	staged   func(ctx context.Context) (bool, error)
@@ -122,6 +124,7 @@ func New(opts Options) (*Engine, error) {
 		measure:  opts.Measure,
 		repairer: opts.Repairer,
 		sleep:    opts.Sleep,
+		runLog:   opts.RunLog,
 		session:  opts.Session,
 		train:    opts.Train,
 		staged:   opts.Staged,
@@ -164,6 +167,9 @@ func New(opts Options) (*Engine, error) {
 	}
 	if e.sleep == nil {
 		e.sleep = sleepContext
+	}
+	if e.runLog == nil {
+		e.runLog = e.store.RunLog
 	}
 	if e.session == nil {
 		e.session = defaultSessionActive
@@ -337,6 +343,16 @@ func (e *Engine) Pass(ctx context.Context) (Result, error) {
 
 		outcome, err := e.converge(ctx, rec)
 		if err != nil {
+			// A repair that ran owes an attempt and its backoff even though
+			// the pass cannot finish. Otherwise a failing run log or
+			// verification read retries the repair at every resync.
+			if outcome.ran {
+				item.Term = term.DidNotHold
+				e.chargeAttempt(&item, now)
+				if persistErr := e.persistItem(item); persistErr != nil {
+					return result, fmt.Errorf("%w; record attempt: %w", err, persistErr)
+				}
+			}
 			return result, err
 		}
 		if outcome.converged {
@@ -344,9 +360,8 @@ func (e *Engine) Pass(ctx context.Context) (Result, error) {
 			continue
 		}
 		item.Term = term.DidNotHold
-		item.Attempts++
-		item.NextAttemptAt = now.Add(backoff(e.cfg.Resync, item.Attempts))
 		item.LastRunLog = outcome.logPath
+		e.chargeAttempt(&item, now)
 		if kind, terminal := terminalKind(outcome.repairErr); terminal {
 			// A protected branch, a diverged remote, or a rejected credential
 			// cannot be fixed by retrying. Block the item for a person; a
@@ -389,6 +404,7 @@ func (e *Engine) Pass(ctx context.Context) (Result, error) {
 
 // convergeResult is one repair attempt and its verification.
 type convergeResult struct {
+	ran       bool
 	converged bool
 	logPath   string
 	repairErr error
@@ -400,33 +416,41 @@ type convergeResult struct {
 // says live. A missing record and an unknown record both leave the repair
 // unproven, so the item stays queued. A repair error is returned separately so
 // the caller can tell a transient network fault from a terminal one.
+//
+// The repair is the first step, so a later read or write error still names it.
+// The caller charges an attempt only when ran is true, so an error raised
+// before the repair could never be mistaken for one that ran.
 func (e *Engine) converge(ctx context.Context, rec contract.Record) (convergeResult, error) {
 	output, runErr := e.repairer.Repair(ctx, rec)
+	out := convergeResult{ran: true}
 
-	logPath, logErr := e.store.RunLog(rec.ID, e.now(), []byte(formatRun(rec, output, runErr)))
+	logPath, logErr := e.runLog(rec.ID, e.now(), []byte(formatRun(rec, output, runErr)))
 	if logErr != nil {
-		return convergeResult{}, logErr
+		return out, logErr
 	}
+	out.logPath = logPath
 	if runErr != nil {
-		return convergeResult{logPath: logPath, repairErr: runErr}, nil
+		out.repairErr = runErr
+		return out, nil
 	}
 
 	for _, delay := range VerifyDelays {
 		if err := e.sleep(ctx, delay); err != nil {
-			return convergeResult{logPath: logPath}, err
+			return out, err
 		}
 		records, err := e.measure(ctx)
 		if err != nil {
-			return convergeResult{logPath: logPath}, fmt.Errorf("verify %s: %w", rec.ID, err)
+			return out, fmt.Errorf("verify %s: %w", rec.ID, err)
 		}
 		if err := e.record(records, e.now()); err != nil {
-			return convergeResult{logPath: logPath}, err
+			return out, err
 		}
 		if st, ok := stateOf(records, rec.ID); ok && st == contract.Live {
-			return convergeResult{converged: true, logPath: logPath}, nil
+			out.converged = true
+			return out, nil
 		}
 	}
-	return convergeResult{logPath: logPath}, nil
+	return out, nil
 }
 
 // record appends one verdict per non-summary record.
@@ -471,6 +495,15 @@ func stateOf(records []contract.Record, id string) (contract.State, bool) {
 		}
 	}
 	return "", false
+}
+
+// chargeAttempt records one failed attempt and schedules its backoff.
+//
+// The caller sets the term and any terminal block, then persists once, so the
+// queue sees one write per attempt.
+func (e *Engine) chargeAttempt(item *state.Item, now time.Time) {
+	item.Attempts++
+	item.NextAttemptAt = now.Add(backoff(e.cfg.Resync, item.Attempts))
 }
 
 // persistItem writes one item immediately, so a pass that hits its deadline
