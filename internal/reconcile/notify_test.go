@@ -188,7 +188,7 @@ func TestPassMarksADidNotHoldFindingUrgent(t *testing.T) {
 		t.Fatalf("second pass: %v", err)
 	}
 	if len(again.Notices) != 0 || len(h.notified) != 1 {
-		t.Errorf("a repeated escalation was surfaced again: %v %v", again.Notices, h.notified)
+		t.Errorf("a repeated finding was surfaced again: %v %v", again.Notices, h.notified)
 	}
 }
 
