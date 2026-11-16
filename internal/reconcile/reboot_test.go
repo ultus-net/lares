@@ -3,7 +3,11 @@ package reconcile
 import (
 	"context"
 	"errors"
+	"fmt"
+	"io/fs"
 	"os"
+	"os/exec"
+	"path/filepath"
 	"strings"
 	"testing"
 	"time"
@@ -261,8 +265,10 @@ func TestHoldClaimsRejectsAReusedPID(t *testing.T) {
 }
 
 func TestTrainCheckForFedoraFamilies(t *testing.T) {
-	previous := runningCommands
-	t.Cleanup(func() { runningCommands = previous })
+	previousCommands, previousTxn := runningCommands, rpmTransaction
+	t.Cleanup(func() { runningCommands, rpmTransaction = previousCommands, previousTxn })
+	// An idle daemon is the baseline for the process-only cases.
+	rpmTransaction = func(context.Context) (bool, error) { return false, nil }
 
 	runningCommands = func() ([]string, error) { return []string{"bash", "rpm-ostree"}, nil }
 	if running, err := defaultTrainRunning(context.Background(), adapter.FedoraAtomic); err != nil || !running {
@@ -298,6 +304,180 @@ func TestTrainCheckForFedoraFamilies(t *testing.T) {
 func TestTrainCheckOfAnUnknownFamilyFailsClosed(t *testing.T) {
 	if running, err := defaultTrainRunning(context.Background(), adapter.Unknown); err == nil {
 		t.Errorf("unknown family: got (%v, nil), want an error", running)
+	}
+}
+
+// TestTrainCheckSeesAHeldRpmOstreeTransaction proves the daemon's own process
+// is not required: rpm-ostreed exits when idle and still reports a held
+// transaction through its status document.
+func TestTrainCheckSeesAHeldRpmOstreeTransaction(t *testing.T) {
+	previousCommands, previousTxn := runningCommands, rpmTransaction
+	t.Cleanup(func() { runningCommands, rpmTransaction = previousCommands, previousTxn })
+	runningCommands = func() ([]string, error) { return []string{"bash", "sleep"}, nil }
+	rpmTransaction = func(context.Context) (bool, error) { return true, nil }
+
+	for _, family := range []adapter.Family{adapter.FedoraAtomic, adapter.Bootc} {
+		if running, err := defaultTrainRunning(context.Background(), family); err != nil || !running {
+			t.Errorf("%s with a held transaction: got (%v, %v), want (true, nil)", family, running, err)
+		}
+	}
+}
+
+// TestTrainCheckFailsClosedWhenTheTransactionCannotBeRead proves a failed status
+// query blocks instead of reporting an idle train.
+func TestTrainCheckFailsClosedWhenTheTransactionCannotBeRead(t *testing.T) {
+	previousCommands, previousTxn := runningCommands, rpmTransaction
+	t.Cleanup(func() { runningCommands, rpmTransaction = previousCommands, previousTxn })
+	runningCommands = func() ([]string, error) { return nil, nil }
+	rpmTransaction = func(context.Context) (bool, error) { return false, errors.New("no bus") }
+
+	for _, family := range []adapter.Family{adapter.FedoraAtomic, adapter.Bootc} {
+		if _, err := defaultTrainRunning(context.Background(), family); err == nil {
+			t.Errorf("%s: a failed status query was treated as an idle train", family)
+		}
+	}
+}
+
+// TestTrainCheckAllowsABootcHostWithoutRpmOstree proves an absent rpm-ostree is
+// not a blocker on bootc, where it is optional, and stays one on Fedora atomic,
+// where the family is defined by it.
+func TestTrainCheckAllowsABootcHostWithoutRpmOstree(t *testing.T) {
+	previousCommands, previousTxn := runningCommands, rpmTransaction
+	t.Cleanup(func() { runningCommands, rpmTransaction = previousCommands, previousTxn })
+	runningCommands = func() ([]string, error) { return nil, nil }
+	rpmTransaction = func(context.Context) (bool, error) {
+		return false, fmt.Errorf("rpm-ostree status: %w", exec.ErrNotFound)
+	}
+
+	if running, err := defaultTrainRunning(context.Background(), adapter.Bootc); err != nil || running {
+		t.Errorf("bootc without rpm-ostree: got (%v, %v), want (false, nil)", running, err)
+	}
+	if _, err := defaultTrainRunning(context.Background(), adapter.FedoraAtomic); err == nil {
+		t.Error("fedora atomic without rpm-ostree was treated as an idle train")
+	}
+}
+
+// TestAgentScanFailsClosedOnAnUnreadableProcess proves an unreadable command
+// name blocks both scans instead of reporting a clear host.
+func TestAgentScanFailsClosedOnAnUnreadableProcess(t *testing.T) {
+	previous := procComm
+	t.Cleanup(func() { procComm = previous })
+	procComm = func(string) ([]byte, error) { return nil, fs.ErrPermission }
+
+	if _, err := defaultAgents(); err == nil {
+		t.Error("defaultAgents read an unreadable command name as clear")
+	}
+	if _, err := runningCommands(); err == nil {
+		t.Error("runningCommands read an unreadable command name as idle")
+	}
+}
+
+// TestAgentScanFailsClosedOnAnUnreadableStartTime proves a process whose start
+// time cannot be read blocks the scan: without it, a hold for a reused pid can
+// claim the process.
+func TestAgentScanFailsClosedOnAnUnreadableStartTime(t *testing.T) {
+	previousComm, previousTicks := procComm, procStartTicks
+	t.Cleanup(func() { procComm, procStartTicks = previousComm, previousTicks })
+	procComm = func(string) ([]byte, error) { return []byte("opencode\n"), nil }
+	procStartTicks = func(int) (uint64, bool) { return 0, false }
+
+	if _, err := defaultAgents(); err == nil {
+		t.Error("defaultAgents read an unreadable start time as a clear host")
+	}
+}
+
+// TestRPMTransactionReadsTheStatusDocument drives the real command path with a
+// fake rpm-ostree, so the exec, the decode, and the transaction check are
+// observed together.
+func TestRPMTransactionReadsTheStatusDocument(t *testing.T) {
+	tests := []struct {
+		name    string
+		body    string
+		held    bool
+		wantErr bool
+	}{
+		{"held", `{"transaction":{"kind":"upgrade"}}`, true, false},
+		{"idle", `{"deployments":[],"transaction":null}`, false, false},
+		{"malformed", `{`, false, true},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			dir := t.TempDir()
+			script := filepath.Join(dir, "rpm-ostree")
+			body := "#!/bin/sh\nprintf '%s' '" + tt.body + "'\n"
+			if err := os.WriteFile(script, []byte(body), 0o700); err != nil {
+				t.Fatal(err)
+			}
+			t.Setenv("PATH", dir)
+
+			held, err := rpmTransaction(context.Background())
+			if (err != nil) != tt.wantErr {
+				t.Fatalf("error %v, want error %v", err, tt.wantErr)
+			}
+			if err == nil && held != tt.held {
+				t.Errorf("held %v, want %v", held, tt.held)
+			}
+		})
+	}
+}
+
+// TestRPMTransactionCanceledContextFailsClosed proves a pass that lost its
+// deadline does not read the train as idle. Start returns the context error
+// before it forks, so no rpm-ostree runs.
+func TestRPMTransactionCanceledContextFailsClosed(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+
+	if _, err := rpmTransaction(ctx); err == nil {
+		t.Error("a canceled context was treated as an idle train")
+	}
+}
+
+// TestProcessScansSkipAProcessThatExited proves the one benign read error stays
+// benign: a process that disappears between the directory read and the file
+// read is not a failure.
+func TestProcessScansSkipAProcessThatExited(t *testing.T) {
+	previous := procComm
+	t.Cleanup(func() { procComm = previous })
+	procComm = func(string) ([]byte, error) { return nil, fs.ErrNotExist }
+
+	if agents, err := defaultAgents(); err != nil || len(agents) != 0 {
+		t.Errorf("defaultAgents: got (%v, %v), want no agents and no error", agents, err)
+	}
+	if names, err := runningCommands(); err != nil || len(names) != 0 {
+		t.Errorf("runningCommands: got (%v, %v), want no names and no error", names, err)
+	}
+}
+
+// TestSessionFailsClosedWhenTheMarkerCannotBeRead proves a marker that exists
+// but cannot be statted keeps the host in use. The indicators path is a regular
+// file, so the marker stat fails with ENOTDIR without depending on permissions
+// and the test also runs as root.
+func TestSessionFailsClosedWhenTheMarkerCannotBeRead(t *testing.T) {
+	home := t.TempDir()
+	t.Setenv("HOME", home)
+	indicators := filepath.Join(home, ".local", "state", "omarchy", "indicators")
+	if err := os.MkdirAll(filepath.Dir(indicators), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(indicators, nil, 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	active, err := defaultSessionActive(context.Background())
+	if !active || err == nil {
+		t.Errorf("active %v, error %v, want the host in use and an error", active, err)
+	}
+}
+
+// TestSessionFailsClosedWithoutAHomeDirectory proves lares cannot claim the host
+// is idle when it cannot locate the stay-awake marker.
+func TestSessionFailsClosedWithoutAHomeDirectory(t *testing.T) {
+	t.Setenv("HOME", "")
+
+	active, err := defaultSessionActive(context.Background())
+	if !active || err == nil {
+		t.Errorf("active %v, error %v, want the host in use and an error", active, err)
 	}
 }
 

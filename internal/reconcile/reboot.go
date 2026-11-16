@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"io/fs"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -226,10 +227,20 @@ func holdClaims(hold state.Hold, agent Agent) bool {
 	return hold.StartTicks == agent.StartTicks
 }
 
+// procComm reads a process's command name. Tests replace it to exercise read
+// errors without depending on the real /proc permissions.
+var procComm = func(path string) ([]byte, error) { return os.ReadFile(path) }
+
+// procStartTicks reads a process's start time. Tests replace it to exercise a
+// process that exits or cannot be read after its command name was read.
+var procStartTicks = state.ProcessStartTicks
+
 // defaultAgents scans /proc for long-horizon processes.
 //
 // A directory read that fails is an error, because returning no agents would
-// claim the host is clear when nothing was checked.
+// claim the host is clear when nothing was checked. A command name or start time
+// that cannot be read is an error for the same reason, except for a process that
+// exited between the directory read and the file read.
 func defaultAgents() ([]Agent, error) {
 	entries, err := os.ReadDir("/proc")
 	if err != nil {
@@ -244,15 +255,21 @@ func defaultAgents() ([]Agent, error) {
 		if err != nil {
 			continue
 		}
-		data, err := os.ReadFile(filepath.Join("/proc", entry.Name(), "comm"))
+		data, err := procComm(filepath.Join("/proc", entry.Name(), "comm"))
 		if err != nil {
-			continue
+			if errors.Is(err, fs.ErrNotExist) {
+				continue
+			}
+			return nil, fmt.Errorf("read %s/comm: %w", entry.Name(), err)
 		}
 		name := strings.TrimSpace(string(data))
 		if !longHorizon[name] {
 			continue
 		}
-		ticks, _ := state.ProcessStartTicks(pid)
+		ticks, ok := procStartTicks(pid)
+		if !ok {
+			return nil, fmt.Errorf("read start time for pid %d", pid)
+		}
 		found = append(found, Agent{PID: pid, Name: name, StartTicks: ticks})
 	}
 	return found, nil
@@ -277,13 +294,20 @@ func isPID(name string) bool {
 // A locked screen counts: the session is still there to lose work. Omarchy's
 // stay-awake marker counts too, and so does a block inhibitor, which a build or
 // a backup takes to keep the host awake. The check fails closed: an unreadable
-// inhibitor list or an unanswerable loginctl treats the host as in use.
+// inhibitor list, an unreadable marker, a missing home directory, or an
+// unanswerable loginctl treats the host as in use.
 func defaultSessionActive(ctx context.Context) (bool, error) {
-	if home, err := os.UserHomeDir(); err == nil {
-		marker := filepath.Join(home, ".local", "state", "omarchy", "indicators", "stay-awake")
-		if _, err := os.Stat(marker); err == nil {
-			return true, nil
+	home, err := os.UserHomeDir()
+	if err != nil {
+		return true, fmt.Errorf("locate home: %w", err)
+	}
+	marker := filepath.Join(home, ".local", "state", "omarchy", "indicators", "stay-awake")
+	if _, err := os.Stat(marker); err != nil {
+		if !errors.Is(err, fs.ErrNotExist) {
+			return true, fmt.Errorf("read stay-awake marker: %w", err)
 		}
+	} else {
+		return true, nil
 	}
 
 	locks, err := inhibitList(ctx)
@@ -322,14 +346,19 @@ func defaultSessionActive(ctx context.Context) (bool, error) {
 // trainProcesses names the programs that hold an update lock on a family.
 //
 // Fedora has no lock file the way Omarchy does, so the check looks for the
-// transaction program itself. A bootc host may still be updated by rpm-ostree,
-// as the Universal Blue images are, so either process holds the train.
+// transaction program itself, then asks rpm-ostreed. A bootc host may still be
+// updated by rpm-ostree, as the Universal Blue images are, so either process
+// holds the train.
 var trainProcesses = map[adapter.Family][]string{
 	adapter.FedoraAtomic: {"rpm-ostree"},
 	adapter.Bootc:        {"bootc", "rpm-ostree"},
 }
 
 // runningCommands lists the command names in /proc. Tests replace it.
+//
+// A command name that cannot be read is an error, because an unreadable process
+// table cannot prove that no update is running. A process that exited between
+// the directory read and the file read is not.
 var runningCommands = func() ([]string, error) {
 	entries, err := os.ReadDir("/proc")
 	if err != nil {
@@ -340,22 +369,44 @@ var runningCommands = func() ([]string, error) {
 		if !entry.IsDir() || !isPID(entry.Name()) {
 			continue
 		}
-		data, err := os.ReadFile(filepath.Join("/proc", entry.Name(), "comm"))
+		data, err := procComm(filepath.Join("/proc", entry.Name(), "comm"))
 		if err != nil {
-			// The process exited between the directory read and this read.
-			continue
+			if errors.Is(err, fs.ErrNotExist) {
+				continue
+			}
+			return nil, fmt.Errorf("read %s/comm: %w", entry.Name(), err)
 		}
 		names = append(names, strings.TrimSpace(string(data)))
 	}
 	return names, nil
 }
 
+// rpmTransaction asks rpm-ostreed whether it holds a transaction.
+//
+// The daemon exits after about a minute idle, so its own process is not a
+// reliable signal: it is often present with nothing running. The status
+// document's transaction field is null when the daemon is idle and non-null
+// while an upgrade or deploy is in progress.
+var rpmTransaction = func(ctx context.Context) (bool, error) {
+	out, err := exec.CommandContext(ctx, "rpm-ostree", "status", "--json").Output()
+	if err != nil {
+		return false, fmt.Errorf("rpm-ostree status: %w", err)
+	}
+	status, err := adapter.ParseRPMOstreeStatus(out)
+	if err != nil {
+		return false, fmt.Errorf("decode rpm-ostree status: %w", err)
+	}
+	return status.Held(), nil
+}
+
 // defaultTrainRunning reports whether an update transaction holds the host.
 //
 // Arch asks Omarchy: exit 0 means held and exit 1 means not held, and any other
-// result is an error. Fedora families look for the transaction program. An
-// unrecognised family has no check at all, which is an error, so the gate blocks
-// instead of guessing that the train is idle.
+// result is an error. Fedora families look for the transaction program, then
+// ask rpm-ostreed, because the daemon can hold a transaction while no
+// transaction program is running. An unrecognised family has no check at all,
+// which is an error, so the gate blocks instead of guessing that the train is
+// idle.
 func defaultTrainRunning(ctx context.Context, family adapter.Family) (bool, error) {
 	if names, ok := trainProcesses[family]; ok {
 		running, err := runningCommands()
@@ -369,7 +420,16 @@ func defaultTrainRunning(ctx context.Context, family adapter.Family) (bool, erro
 				}
 			}
 		}
-		return false, nil
+		held, err := rpmTransaction(ctx)
+		if err != nil {
+			// bootc does not require rpm-ostree. An absent command means this
+			// host cannot update through rpm-ostree, so it is not a blocker.
+			if family == adapter.Bootc && errors.Is(err, exec.ErrNotFound) {
+				return false, nil
+			}
+			return false, err
+		}
+		return held, nil
 	}
 	if family != adapter.Arch {
 		return false, fmt.Errorf("no update-train check for family %q", family)

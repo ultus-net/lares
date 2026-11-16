@@ -42,8 +42,9 @@ A check that cannot read the host returns `unknown`. The queue shows the item
 with the `unverified` term and never repairs it. A family with no adapter
 reports `patch-train` as `unknown` instead of claiming the host is current.
 
-`systemd-failed` names a scope it could not read. If both scopes fail, the
-record is `unknown`, so an unreadable `systemctl` never looks like an idle host.
+`systemd-failed` names a scope it could not read. If both scopes fail, or if one
+scope fails and no other scope reported a failed unit, the record is `unknown`.
+An unreadable `systemctl` therefore never looks like an idle host.
 
 `systemd-failed` excludes `systemd-remount-fs.service` on a Fedora atomic or
 bootc host whose root is read-only. An immutable composefs root cannot be
@@ -276,8 +277,8 @@ can_reboot = window_open AND no_hold AND no_interactive_session AND no_own_job
 | --- | --- |
 | `window` | the local clock is outside `window_start`-`window_end` |
 | `hold` | any live hold exists, or a live `opencode`/`orca` process has none |
-| `scan` | `/proc` could not be read, so no agent could be ruled out |
-| `session` | a session other than the user's manager is logged in, Omarchy's stay-awake marker exists, a `block` or `block-weak` inhibitor lock is held, or `loginctl` cannot answer |
+| `scan` | `/proc`, or a process's command name or start time, could not be read, so no agent could be ruled out |
+| `session` | a session other than the user's manager is logged in, Omarchy's stay-awake marker exists or cannot be read, `$HOME` cannot be located, a `block` or `block-weak` inhibitor lock is held, or `loginctl` cannot answer |
 | `own-job` | an update transaction is running, or its state cannot be read |
 
 The term order is the evaluation order, so the queue names the first blocker.
@@ -295,9 +296,13 @@ and Fedora atomic both ship the command. A host without it fails the read, so
 the gate blocks rather than reading the host as idle.
 
 The train check is per family. Arch asks `omarchy-update-lock held`. Fedora
-atomic and bootc look for a running `rpm-ostree` or `bootc` process. A family
-with no check at all is an error, so it blocks rather than claiming the train is
-idle.
+atomic and bootc look for a running `rpm-ostree` or `bootc` process, then ask
+`rpm-ostree status --json` whether the daemon holds a transaction. The daemon
+process alone is not the signal: it exits after about a minute idle, and it can
+be present with no transaction. A status query that fails blocks, except on a
+bootc host where `rpm-ostree` is absent, because that host cannot update through
+it. A family with no check at all is an error, so it blocks rather than claiming
+the train is idle.
 
 `pass` evaluates the gate last, while it still holds `lock`, unless
 `reboot_from_pass` is false. `lares reboot` evaluates and acts in one lock hold,
