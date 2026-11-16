@@ -15,6 +15,7 @@ import (
 	"github.com/ultus-net/lares/internal/contract"
 	"github.com/ultus-net/lares/internal/reconcile"
 	"github.com/ultus-net/lares/internal/state"
+	"github.com/ultus-net/lares/internal/term"
 )
 
 var base = time.Date(2026, 11, 15, 12, 0, 0, 0, time.Local)
@@ -36,11 +37,10 @@ func newModel(t *testing.T, records ...[]contract.Record) Model {
 	}
 	index := 0
 	engine, err := reconcile.New(reconcile.Options{
-		Config:  cfg,
-		Store:   store,
-		Family:  adapter.Arch,
-		RepoDir: store.Dir(),
-		Now:     func() time.Time { return base },
+		Config: cfg,
+		Store:  store,
+		Family: adapter.Arch,
+		Now:    func() time.Time { return base },
 		Measure: func(context.Context) ([]contract.Record, error) {
 			if len(records) == 0 {
 				return []contract.Record{{ID: contract.SummaryID, State: contract.Live}}, nil
@@ -52,7 +52,6 @@ func newModel(t *testing.T, records ...[]contract.Record) Model {
 			index++
 			return records[i], nil
 		},
-		Run:      func(context.Context, string, []string) (string, error) { return "", nil },
 		Sleep:    func(context.Context, time.Duration) error { return nil },
 		Session:  func(context.Context) (bool, error) { return false, nil },
 		Train:    func(context.Context) (bool, error) { return false, nil },
@@ -111,6 +110,27 @@ func TestRowsSortBySeverityThenAge(t *testing.T) {
 		if rows[i].ID != id {
 			t.Errorf("row %d is %q, want %q", i, rows[i].ID, id)
 		}
+	}
+}
+
+func TestRowsRankEscalatedBackupFirst(t *testing.T) {
+	status := reconcile.Status{
+		Queue: state.Queue{Items: []state.Item{
+			// Older and less severe, but not escalated.
+			{ID: "backup-demo", Term: term.Escalated, FirstSeen: base.Add(-time.Hour)},
+			{ID: "broken", Term: "needs-operator", FirstSeen: base.Add(-72 * time.Hour)},
+		}},
+		Verdicts: map[string]state.Verdict{
+			"backup-demo": {ID: "backup-demo", State: "stale", Detail: "3 commits ahead", At: base},
+			"broken":      {ID: "broken", State: "not-live", Detail: "failed unit", At: base},
+		},
+	}
+	rows := rowsFrom(status, base)
+	if len(rows) != 2 {
+		t.Fatalf("got %d rows, want 2", len(rows))
+	}
+	if rows[0].ID != "backup-demo" || !rows[0].Escalated {
+		t.Fatalf("first row is %+v, want the escalated backup", rows[0])
 	}
 }
 

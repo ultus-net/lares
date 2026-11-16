@@ -1,15 +1,14 @@
 // Package reconcile runs one measurement, converges the repairs that are safe
 // to repeat, verifies that the state moved, and queues the rest.
 //
-// It owns the policy, not the probes or the verbs. A probe is a command in the
-// dotfiles repository and a repair verb is the `fix` field the probe prints, so
-// a new check arrives as data. The one host check lares owns is whether an
-// update is staged on a Fedora family, because the Arch patch-train record does
-// not describe a host that has no patch-train timer.
+// It owns the policy, not the checks or the verbs. The measure engine supplies
+// both: a check produces a record, and a check in the safe set carries an
+// in-process repair. A record from an external probe is always queued, because
+// lares does not run a repair it cannot prove.
 //
-// Every side effect is injectable: measure, run a command, sleep, read the
-// session state, ask the update-train lock, list agent processes, and activate a
-// reboot. Tests drive the whole loop without touching the host.
+// Every side effect is injectable: measure, repair, sleep, read the session
+// state, ask the update-train lock, list agent processes, and activate a reboot.
+// Tests drive the whole loop without touching the host.
 package reconcile
 
 import (
@@ -17,14 +16,15 @@ import (
 	"errors"
 	"fmt"
 	"os/exec"
-	"path/filepath"
 	"strings"
 	"time"
 
 	"github.com/ultus-net/lares/internal/adapter"
 	"github.com/ultus-net/lares/internal/config"
 	"github.com/ultus-net/lares/internal/contract"
+	"github.com/ultus-net/lares/internal/measure"
 	"github.com/ultus-net/lares/internal/state"
+	"github.com/ultus-net/lares/internal/term"
 )
 
 // VerifyDelays is the ladder that decides whether a repair held.
@@ -41,6 +41,16 @@ type Agent struct {
 	StartTicks uint64
 }
 
+// Repairer decides which records are safe and runs their repairs.
+//
+// The measure engine implements it. A test injects a fake, and an external probe
+// injects none, which queues every record.
+type Repairer interface {
+	Safe(contract.Record) bool
+	Term(contract.Record) string
+	Repair(ctx context.Context, rec contract.Record) (string, error)
+}
+
 // Options are the dependencies of an Engine. New fills the zero values with the
 // host defaults.
 type Options struct {
@@ -49,13 +59,9 @@ type Options struct {
 	Family   adapter.Family
 	Adapters map[adapter.Family]adapter.Adapter
 
-	// RepoDir is the dotfiles checkout that holds the probe and the repair
-	// verbs. Relative audit paths resolve against it.
-	RepoDir string
-
 	Now      func() time.Time
 	Measure  func(ctx context.Context) ([]contract.Record, error)
-	Run      func(ctx context.Context, dir string, argv []string) (string, error)
+	Repairer Repairer
 	Sleep    func(ctx context.Context, d time.Duration) error
 	Session  func(ctx context.Context) (bool, error)
 	Train    func(ctx context.Context) (bool, error)
@@ -70,11 +76,10 @@ type Engine struct {
 	store    *state.Store
 	family   adapter.Family
 	adapters map[adapter.Family]adapter.Adapter
-	repoDir  string
 
 	now      func() time.Time
 	measure  func(ctx context.Context) ([]contract.Record, error)
-	run      func(ctx context.Context, dir string, argv []string) (string, error)
+	repairer Repairer
 	sleep    func(ctx context.Context, d time.Duration) error
 	session  func(ctx context.Context) (bool, error)
 	train    func(ctx context.Context) (bool, error)
@@ -107,10 +112,9 @@ func New(opts Options) (*Engine, error) {
 		store:    opts.Store,
 		family:   opts.Family,
 		adapters: opts.Adapters,
-		repoDir:  opts.RepoDir,
 		now:      opts.Now,
 		measure:  opts.Measure,
-		run:      opts.Run,
+		repairer: opts.Repairer,
 		sleep:    opts.Sleep,
 		session:  opts.Session,
 		train:    opts.Train,
@@ -121,16 +125,35 @@ func New(opts Options) (*Engine, error) {
 	if e.now == nil {
 		e.now = time.Now
 	}
-	if e.repoDir == "" {
-		e.repoDir = "."
-	}
-	if e.measure == nil {
-		e.measure = func(ctx context.Context) ([]contract.Record, error) {
-			return contract.MeasureIn(ctx, e.repoDir, resolveProbe(cfg.AuditCommand, e.repoDir))
+	if e.repairer == nil {
+		if len(cfg.AuditCommand) > 0 {
+			// An external probe proves nothing lares can repair, so every
+			// record it prints queues.
+			e.repairer = noRepairer{}
+		} else {
+			engine, err := measure.New(measure.Options{
+				Config:  cfg,
+				Family:  opts.Family,
+				Adapter: opts.Adapters[opts.Family],
+				Now:     e.now,
+			})
+			if err != nil {
+				return nil, err
+			}
+			e.repairer = engine
+			if e.measure == nil {
+				e.measure = engine.Measure
+			}
 		}
 	}
-	if e.run == nil {
-		e.run = runCommand
+	if e.measure == nil {
+		if len(cfg.AuditCommand) == 0 {
+			return nil, errors.New("reconcile: measure is required when no audit_command is configured")
+		}
+		argv := append([]string(nil), cfg.AuditCommand...)
+		e.measure = func(ctx context.Context) ([]contract.Record, error) {
+			return contract.Measure(ctx, argv)
+		}
 	}
 	if e.sleep == nil {
 		e.sleep = sleepContext
@@ -155,25 +178,26 @@ func New(opts Options) (*Engine, error) {
 	return e, nil
 }
 
-// resolveProbe makes a relative script path absolute against repoDir.
-func resolveProbe(argv []string, repoDir string) []string {
-	if len(argv) < 2 || filepath.IsAbs(argv[1]) {
-		return argv
-	}
-	out := append([]string(nil), argv...)
-	out[1] = filepath.Join(repoDir, argv[1])
-	return out
+// noRepairer queues every record. It is the policy for an external probe.
+type noRepairer struct{}
+
+// Safe always reports false.
+func (noRepairer) Safe(contract.Record) bool { return false }
+
+// Term names the operator, because lares cannot prove an external repair.
+func (noRepairer) Term(contract.Record) string { return term.NeedsOperator }
+
+// Repair refuses, because a check lares does not own is never run unattended.
+func (noRepairer) Repair(context.Context, contract.Record) (string, error) {
+	return "", errors.New("reconcile: an external record is never repaired unattended")
 }
 
-// runCommand runs argv in dir and returns combined output.
-func runCommand(ctx context.Context, dir string, argv []string) (string, error) {
-	if len(argv) == 0 || argv[0] == "" {
-		return "", errors.New("reconcile: empty command")
-	}
-	cmd := exec.CommandContext(ctx, argv[0], argv[1:]...)
-	cmd.Dir = dir
-	out, err := cmd.CombinedOutput()
-	return string(out), err
+// Measure runs one measurement without taking the lock or touching the queue.
+//
+// The CLI uses it for `lares measure`, which records verdicts but derives no
+// queue. A pass calls the same function under the lock.
+func (e *Engine) Measure(ctx context.Context) ([]contract.Record, error) {
+	return e.measure(ctx)
 }
 
 // sleepContext waits d or until ctx ends.
@@ -235,9 +259,9 @@ func (e *Engine) Pass(ctx context.Context) (Result, error) {
 	// A failed process scan cannot prove that no agent is running, so it holds
 	// the work just as a live hold does, under its own term.
 	unclaimed, scanErr := e.unclaimedAgents(holds)
-	heldTerm := termHold
+	heldTerm := term.Hold
 	if scanErr != nil {
-		heldTerm = termScan
+		heldTerm = term.Scan
 	}
 	held := len(holds) > 0 || scanErr != nil || len(unclaimed) > 0
 
@@ -258,20 +282,29 @@ func (e *Engine) Pass(ctx context.Context) (Result, error) {
 		}
 
 		if deferral, ok := deferrals[rec.ID]; ok && deferral.Until.After(now) {
-			item.Term = termDeferred
+			item.Term = term.Deferred
 			item.NextAttemptAt = deferral.Until
 			next.Items = append(next.Items, item)
 			result.Skipped = append(result.Skipped, rec.ID)
 			continue
 		}
-		if rec.State == contract.Unknown {
-			item.Term = termUnverified
+		if item.Blocked != "" {
+			// A terminal push failure is not retried blind. The item leaves the
+			// queue when a measurement proves it live, or the operator clears
+			// the block with a deferral.
+			item.Term = term.NeedsOperator
 			next.Items = append(next.Items, item)
 			result.Queued = append(result.Queued, rec.ID)
 			continue
 		}
-		if !safeToConverge(rec.ID) || rec.Fix == "" {
-			item.Term = repairTerm(rec.ID)
+		if rec.State == contract.Unknown {
+			item.Term = term.Unverified
+			next.Items = append(next.Items, item)
+			result.Queued = append(result.Queued, rec.ID)
+			continue
+		}
+		if !e.repairer.Safe(rec) {
+			item.Term = e.repairer.Term(rec)
 			next.Items = append(next.Items, item)
 			result.Queued = append(result.Queued, rec.ID)
 			continue
@@ -283,24 +316,40 @@ func (e *Engine) Pass(ctx context.Context) (Result, error) {
 			continue
 		}
 		if item.NextAttemptAt.After(now) {
-			item.Term = termBackoff
+			item.Term = term.Backoff
+			if isBackupItem(rec.ID) && item.Attempts >= EscalateAfterAttempts {
+				item.Term = term.Escalated
+			}
 			next.Items = append(next.Items, item)
 			result.Skipped = append(result.Skipped, rec.ID)
 			continue
 		}
 
-		converged, logPath, err := e.converge(ctx, rec)
+		outcome, err := e.converge(ctx, rec)
 		if err != nil {
 			return result, err
 		}
-		if converged {
+		if outcome.converged {
 			result.Converged = append(result.Converged, rec.ID)
 			continue
 		}
-		item.Term = termDidNotHold
+		item.Term = term.DidNotHold
 		item.Attempts++
 		item.NextAttemptAt = now.Add(backoff(e.cfg.Resync, item.Attempts))
-		item.LastRunLog = logPath
+		item.LastRunLog = outcome.logPath
+		if kind, terminal := terminalKind(outcome.repairErr); terminal {
+			// A protected branch, a diverged remote, or a rejected credential
+			// cannot be fixed by retrying. Block the item for a person; a
+			// deferral clears it once the cause is fixed.
+			item.Blocked = kind
+			item.Term = term.NeedsOperator
+			item.NextAttemptAt = time.Time{}
+		} else if isBackupItem(rec.ID) && item.Attempts >= EscalateAfterAttempts {
+			// On a single-disk host the checkout is the only copy, so a
+			// retryable unpushed backlog outranks the rest of the punch list.
+			// A terminal failure keeps needs-operator: retrying cannot help.
+			item.Term = term.Escalated
+		}
 		next.Items = append(next.Items, item)
 		result.Escalated = append(result.Escalated, rec.ID)
 		// Keep the attempt even if the pass hits its deadline later.
@@ -322,39 +371,46 @@ func (e *Engine) Pass(ctx context.Context) (Result, error) {
 	return result, nil
 }
 
-// converge runs the record's repair verb, then re-measures on the verify ladder.
-//
-// It returns true only when a verification measurement names the item and says
-// live. A missing record and an unknown record both leave the repair unproven,
-// so the item stays queued.
-func (e *Engine) converge(ctx context.Context, rec contract.Record) (bool, string, error) {
-	argv := strings.Fields(rec.Fix)
-	output, runErr := e.run(ctx, e.repoDir, argv)
+// convergeResult is one repair attempt and its verification.
+type convergeResult struct {
+	converged bool
+	logPath   string
+	repairErr error
+}
 
-	logPath, logErr := e.store.RunLog(rec.ID, e.now(), []byte(formatRun(rec, argv, output, runErr)))
+// converge runs the record's repair, then re-measures on the verify ladder.
+//
+// It reports converged only when a verification measurement names the item and
+// says live. A missing record and an unknown record both leave the repair
+// unproven, so the item stays queued. A repair error is returned separately so
+// the caller can tell a transient network fault from a terminal one.
+func (e *Engine) converge(ctx context.Context, rec contract.Record) (convergeResult, error) {
+	output, runErr := e.repairer.Repair(ctx, rec)
+
+	logPath, logErr := e.store.RunLog(rec.ID, e.now(), []byte(formatRun(rec, output, runErr)))
 	if logErr != nil {
-		return false, "", logErr
+		return convergeResult{}, logErr
 	}
 	if runErr != nil {
-		return false, logPath, nil
+		return convergeResult{logPath: logPath, repairErr: runErr}, nil
 	}
 
 	for _, delay := range VerifyDelays {
 		if err := e.sleep(ctx, delay); err != nil {
-			return false, logPath, err
+			return convergeResult{logPath: logPath}, err
 		}
 		records, err := e.measure(ctx)
 		if err != nil {
-			return false, logPath, fmt.Errorf("verify %s: %w", rec.ID, err)
+			return convergeResult{logPath: logPath}, fmt.Errorf("verify %s: %w", rec.ID, err)
 		}
 		if err := e.record(records, e.now()); err != nil {
-			return false, logPath, err
+			return convergeResult{logPath: logPath}, err
 		}
 		if st, ok := stateOf(records, rec.ID); ok && st == contract.Live {
-			return true, logPath, nil
+			return convergeResult{converged: true, logPath: logPath}, nil
 		}
 	}
-	return false, logPath, nil
+	return convergeResult{logPath: logPath}, nil
 }
 
 // record appends one verdict per non-summary record.
@@ -372,12 +428,14 @@ func (e *Engine) record(records []contract.Record, at time.Time) error {
 }
 
 // formatRun renders one converge run for the item's log.
-func formatRun(rec contract.Record, argv []string, output string, runErr error) string {
+func formatRun(rec contract.Record, output string, runErr error) string {
 	var b strings.Builder
 	fmt.Fprintf(&b, "item: %s\n", rec.ID)
 	fmt.Fprintf(&b, "state: %s\n", rec.State)
 	fmt.Fprintf(&b, "detail: %s\n", rec.Detail)
-	fmt.Fprintf(&b, "command: %s\n", strings.Join(argv, " "))
+	if rec.Fix != "" {
+		fmt.Fprintf(&b, "verb: %s\n", rec.Fix)
+	}
 	if runErr != nil {
 		fmt.Fprintf(&b, "error: %v\n", runErr)
 	}
@@ -419,6 +477,25 @@ func (e *Engine) persistItem(item state.Item) error {
 	}
 	_, err = e.store.SaveQueue(queue)
 	return err
+}
+
+// EscalateAfterAttempts is the number of failed non-terminal pushes after which
+// an unpushed backup outranks the rest of the punch list.
+const EscalateAfterAttempts = 3
+
+// isBackupItem reports whether id names an outbound backup check.
+func isBackupItem(id string) bool {
+	return strings.HasPrefix(id, "backup-")
+}
+
+// terminalKind returns the classified kind when a repair failure cannot be
+// fixed by retrying. A network fault is the only retryable kind.
+func terminalKind(err error) (string, bool) {
+	var pe *measure.PushError
+	if errors.As(err, &pe) && !pe.Retryable() {
+		return pe.Kind, true
+	}
+	return "", false
 }
 
 // backoff doubles the resync interval per attempt and caps at one day.
@@ -469,15 +546,18 @@ func (e *Engine) Defer(id string, d time.Duration, reason string) (time.Time, er
 		if queue.Items[i].ID != id {
 			continue
 		}
-		queue.Items[i].Term = termDeferred
+		queue.Items[i].Term = term.Deferred
 		queue.Items[i].NextAttemptAt = until
+		// A deferral is the operator's action on a terminal push failure, so it
+		// clears the block and lets the next attempt try again.
+		queue.Items[i].Blocked = ""
 		found = true
 		break
 	}
 	if !found {
 		queue.Items = append(queue.Items, state.Item{
 			ID:            id,
-			Term:          termDeferred,
+			Term:          term.Deferred,
 			FirstSeen:     now,
 			NextAttemptAt: until,
 		})

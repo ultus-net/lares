@@ -17,7 +17,7 @@ const (
 // SummaryID is the id of the single trailing record that counts the rest.
 const SummaryID = "summary"
 
-// Record is one verdict from the probe.
+// Record is one verdict from a check or an external probe.
 type Record struct {
 	ID     string `json:"id"`
 	State  State  `json:"state"`
@@ -26,7 +26,8 @@ type Record struct {
 }
 
 // IsFinding reports whether the record is a finding: not-live or stale. The
-// CLI uses this for its exit code, so an unknown record does not fail a measure.
+// measure command uses this for its exit code, so an unknown record does not
+// fail a measure.
 func (r Record) IsFinding() bool {
 	return r.State == NotLive || r.State == Stale
 }

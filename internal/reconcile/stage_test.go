@@ -9,6 +9,7 @@ import (
 	"github.com/ultus-net/lares/internal/adapter"
 	"github.com/ultus-net/lares/internal/contract"
 	"github.com/ultus-net/lares/internal/state"
+	"github.com/ultus-net/lares/internal/term"
 )
 
 // fedoraAdapters holds the two families whose stage verb needs root.
@@ -80,8 +81,8 @@ func TestPassQueuesTheStageCommandOnFedora(t *testing.T) {
 			if !ok {
 				t.Fatal("patch-train not queued")
 			}
-			if item.Term != termNeedsGrant {
-				t.Errorf("term %q, want %q", item.Term, termNeedsGrant)
+			if item.Term != term.NeedsGrant {
+				t.Errorf("term %q, want %q", item.Term, term.NeedsGrant)
 			}
 			verdict := newestVerdict(t, h.store, "patch-train")
 			if verdict.Fix != tc.want {
@@ -138,8 +139,8 @@ func TestPassKeepsTheItemQueuedWhenTheStagedCheckFails(t *testing.T) {
 	if !ok {
 		t.Fatal("patch-train not queued after a failed staged check")
 	}
-	if item.Term != termNeedsGrant {
-		t.Errorf("term %q, want %q", item.Term, termNeedsGrant)
+	if item.Term != term.NeedsGrant {
+		t.Errorf("term %q, want %q", item.Term, term.NeedsGrant)
 	}
 	if item.Attempts != 0 {
 		t.Errorf("attempts %d, want 0: a failed check must not escalate", item.Attempts)

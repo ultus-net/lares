@@ -1,9 +1,9 @@
-// Package contract decodes the verdict stream that the dotfiles probe prints.
+// Package contract decodes a verdict stream from an external probe.
 //
-// The probe is external on purpose. `lares` owns no check and no repair: a
-// script in the dotfiles repository measures the host and prints one JSON
-// object per line, and this package reads that stream. When the probe gains a
-// check, the reader learns it without a code change.
+// The built-in checks produce records in-process and never use this package's
+// parser. The stream exists for the optional audit_command escape hatch: a
+// script measures the host and prints one JSON object per line, and this
+// package reads it. lares never repairs a record an external probe produced.
 //
 // The stream is one object per line with exactly the keys `id`, `state`,
 // `detail` and `fix`, and a single `summary` record last. `state` is one of

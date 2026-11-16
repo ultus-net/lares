@@ -49,7 +49,6 @@ type cli struct {
 	home      string
 	state     string
 	configDir string
-	repoDir   string
 	config    string
 	probe     string
 	env       []string
@@ -65,10 +64,9 @@ func newCLI(t *testing.T) *cli {
 		home:      filepath.Join(root, "home"),
 		state:     filepath.Join(xdgState, "lares"),
 		configDir: filepath.Join(root, "xdg-config", "lares"),
-		repoDir:   filepath.Join(root, "repo"),
 		probe:     filepath.Join(root, "probe.sh"),
 	}
-	for _, dir := range []string{c.home, c.configDir, c.repoDir, filepath.Dir(xdgState)} {
+	for _, dir := range []string{c.home, c.configDir, filepath.Dir(xdgState)} {
 		if err := os.MkdirAll(dir, 0o755); err != nil {
 			t.Fatalf("create %s: %v", dir, err)
 		}
@@ -81,23 +79,21 @@ func newCLI(t *testing.T) *cli {
 		"XDG_CONFIG_HOME="+filepath.Dir(c.configDir),
 		"XDG_STATE_HOME="+xdgState,
 		"USER=operator",
-		"LARES_REPO="+c.repoDir,
 	)
 	return c
 }
 
 // writeConfig writes the config every command loads.
 //
-// The reboot gate is off, so a pass never reboots or queues a reboot on the test
-// host.
+// The external probe keeps the measurement hermetic. The reboot gate is off, so
+// a pass never reboots or queues a reboot on the test host.
 func (c *cli) writeConfig(t *testing.T) {
 	t.Helper()
 	body := fmt.Sprintf(`audit_command = ["bash", %q]
 state_dir = %q
 config_dir = %q
-repo_dir = %q
 reboot_from_pass = false
-`, c.probe, c.state, c.configDir, c.repoDir)
+`, c.probe, c.state, c.configDir)
 	if err := os.WriteFile(c.config, []byte(body), 0o600); err != nil {
 		t.Fatalf("write config: %v", err)
 	}
@@ -438,8 +434,8 @@ func TestInstallWritesNoSudoers(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if !strings.Contains(string(config), fmt.Sprintf("repo_dir = %q", c.repoDir)) {
-		t.Errorf("config does not record the checkout:\n%s", config)
+	if !strings.Contains(string(config), fmt.Sprintf("repos_dir = %q", filepath.Join(c.home, "Documents", "projects"))) {
+		t.Errorf("config does not record the repositories directory:\n%s", config)
 	}
 	adapters, err := os.ReadFile(paths[4])
 	if err != nil {

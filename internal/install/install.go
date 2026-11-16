@@ -59,7 +59,7 @@ func Install(opts Options) ([]string, error) {
 		return nil, fmt.Errorf("create unit directory: %w", err)
 	}
 	servicePath := filepath.Join(unitsDir, "lares.service")
-	if err := replaceFile(servicePath, ServiceUnit(opts.Config.RepoDir), 0o644); err != nil {
+	if err := replaceFile(servicePath, ServiceUnit(), 0o644); err != nil {
 		return nil, err
 	}
 	timerPath := filepath.Join(unitsDir, "lares.timer")
@@ -144,11 +144,18 @@ func createIfAbsent(path, body string, mode os.FileMode) error {
 func ConfigTOML(cfg config.Config) string {
 	var b strings.Builder
 	b.WriteString("# lares configuration. Written once; edits survive a re-install.\n\n")
-	fmt.Fprintf(&b, "audit_command = %s\n", tomlArray(cfg.AuditCommand))
+	if len(cfg.AuditCommand) > 0 {
+		fmt.Fprintf(&b, "audit_command = %s\n", tomlArray(cfg.AuditCommand))
+	} else {
+		b.WriteString("# audit_command is optional. When unset, lares measures the host in-process.\n")
+	}
 	fmt.Fprintf(&b, "state_dir = %q\n", cfg.StateDir)
 	fmt.Fprintf(&b, "config_dir = %q\n", cfg.ConfigDir)
-	if cfg.RepoDir != "" {
-		fmt.Fprintf(&b, "repo_dir = %q\n", cfg.RepoDir)
+	if cfg.ReposDir != "" {
+		fmt.Fprintf(&b, "repos_dir = %q\n", cfg.ReposDir)
+	}
+	if len(cfg.Repos) > 0 {
+		fmt.Fprintf(&b, "repos = %s\n", tomlArray(cfg.Repos))
 	}
 	fmt.Fprintf(&b, "window_start = %q\n", cfg.WindowStart)
 	fmt.Fprintf(&b, "window_end = %q\n", cfg.WindowEnd)
@@ -205,24 +212,19 @@ func tomlArray(argv []string) string {
 
 // ServiceUnit returns lares.service.
 //
-// A non-empty repoDir becomes WorkingDirectory, so the installed timer finds the
-// probe in the checkout it was configured against instead of the unit's default
-// working directory.
-func ServiceUnit(repoDir string) string {
-	var b strings.Builder
-	b.WriteString(`[Unit]
+// The unit runs in the user's home. lares measures the host in-process, so the
+// timer needs no checkout and no working directory of its own.
+func ServiceUnit() string {
+	return `[Unit]
 Description=lares reconcile pass
 
 [Service]
 Type=oneshot
 ExecStart=%h/.local/bin/lares pass
+WorkingDirectory=%h
 Nice=10
 IOSchedulingClass=idle
-`)
-	if repoDir != "" {
-		fmt.Fprintf(&b, "WorkingDirectory=%s\n", repoDir)
-	}
-	return b.String()
+`
 }
 
 // TimerUnit returns lares.timer for the given interval.

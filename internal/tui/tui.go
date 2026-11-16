@@ -19,6 +19,7 @@ import (
 	"github.com/ultus-net/lares/internal/contract"
 	"github.com/ultus-net/lares/internal/reconcile"
 	"github.com/ultus-net/lares/internal/state"
+	"github.com/ultus-net/lares/internal/term"
 )
 
 // Options wires the punch list to the engine and the store.
@@ -30,12 +31,13 @@ type Options struct {
 
 // row is one line of the punch list.
 type row struct {
-	ID     string
-	State  contract.State
-	Detail string
-	Fix    string
-	Age    time.Duration
-	Action string
+	ID        string
+	State     contract.State
+	Detail    string
+	Fix       string
+	Age       time.Duration
+	Action    string
+	Escalated bool
 }
 
 // Model is the Bubble Tea model.
@@ -132,12 +134,13 @@ func rowsFrom(status reconcile.Status, now time.Time) []row {
 			detail = item.Term
 		}
 		rows = append(rows, row{
-			ID:     item.ID,
-			State:  st,
-			Detail: detail,
-			Fix:    fix,
-			Age:    now.Sub(item.FirstSeen),
-			Action: actionFor(item.ID),
+			ID:        item.ID,
+			State:     st,
+			Detail:    detail,
+			Fix:       fix,
+			Age:       now.Sub(item.FirstSeen),
+			Action:    actionFor(item.ID),
+			Escalated: item.Term == term.Escalated,
 		})
 	}
 
@@ -160,6 +163,11 @@ func rowsFrom(status reconcile.Status, now time.Time) []row {
 	}
 
 	sort.SliceStable(rows, func(i, j int) bool {
+		// An escalated backup outranks severity: the checkout may be the only
+		// copy on the host.
+		if rows[i].Escalated != rows[j].Escalated {
+			return rows[i].Escalated
+		}
 		if severity(rows[i].State) != severity(rows[j].State) {
 			return severity(rows[i].State) < severity(rows[j].State)
 		}

@@ -268,13 +268,25 @@ func TestTrainCheckForFedoraFamilies(t *testing.T) {
 	if running, err := defaultTrainRunning(context.Background(), adapter.FedoraAtomic); err != nil || !running {
 		t.Errorf("rpm-ostree running: got (%v, %v), want (true, nil)", running, err)
 	}
-	if running, err := defaultTrainRunning(context.Background(), adapter.Bootc); err != nil || running {
-		t.Errorf("bootc with no bootc process: got (%v, %v), want (false, nil)", running, err)
+	// A bootc host may still update through rpm-ostree, so that process must
+	// hold the train there too.
+	if running, err := defaultTrainRunning(context.Background(), adapter.Bootc); err != nil || !running {
+		t.Errorf("bootc host with rpm-ostree running: got (%v, %v), want (true, nil)", running, err)
 	}
 
 	runningCommands = func() ([]string, error) { return []string{"bootc"}, nil }
 	if running, err := defaultTrainRunning(context.Background(), adapter.Bootc); err != nil || !running {
 		t.Errorf("bootc running: got (%v, %v), want (true, nil)", running, err)
+	}
+	if running, err := defaultTrainRunning(context.Background(), adapter.FedoraAtomic); err != nil || running {
+		t.Errorf("fedora-atomic with only bootc running: got (%v, %v), want (false, nil)", running, err)
+	}
+
+	runningCommands = func() ([]string, error) { return []string{"bash", "sleep"}, nil }
+	for _, family := range []adapter.Family{adapter.FedoraAtomic, adapter.Bootc} {
+		if running, err := defaultTrainRunning(context.Background(), family); err != nil || running {
+			t.Errorf("%s with no transaction: got (%v, %v), want (false, nil)", family, running, err)
+		}
 	}
 
 	runningCommands = func() ([]string, error) { return nil, errors.New("no /proc") }
