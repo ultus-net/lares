@@ -22,6 +22,9 @@ func TestDefault(t *testing.T) {
 	if !cfg.RebootFromPass {
 		t.Error("a pass must evaluate the reboot gate by default")
 	}
+	if cfg.Notify != NotifyAuto {
+		t.Errorf("notify %q, want %q", cfg.Notify, NotifyAuto)
+	}
 	if cfg.ReposDir != "" || len(cfg.Repos) != 0 {
 		t.Errorf("repos should be empty until Load: %q %v", cfg.ReposDir, cfg.Repos)
 	}
@@ -142,6 +145,7 @@ func TestLoadRejects(t *testing.T) {
 		{"bad window start", "window_start = \"2:00\"\n", "window_start"},
 		{"bad window end", "window_end = \"25:00\"\n", "window_end"},
 		{"empty program", "audit_command = [\"\"]\n", "audit_command"},
+		{"bad notify mode", "notify = \"carrier-pigeon\"\n", "notify"},
 		{"empty repos entry", "repos = [\"/a\", \"\"]\n", "repos"},
 	}
 	for _, tt := range tests {
@@ -167,6 +171,7 @@ func TestValidateDerivesFields(t *testing.T) {
 	cfg := Default()
 	cfg.StateDir = "/state"
 	cfg.ConfigDir = "/config"
+	cfg.Notify = ""
 	if err := cfg.Validate(); err != nil {
 		t.Fatalf("Validate: %v", err)
 	}
@@ -175,6 +180,9 @@ func TestValidateDerivesFields(t *testing.T) {
 	}
 	if cfg.Window != (Window{Start: "02:00", End: "05:00"}) {
 		t.Errorf("window %+v", cfg.Window)
+	}
+	if cfg.Notify != NotifyAuto {
+		t.Errorf("notify %q, want %q", cfg.Notify, NotifyAuto)
 	}
 }
 

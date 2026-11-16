@@ -10,6 +10,7 @@ import (
 	"io/fs"
 	"os"
 	"path/filepath"
+	"sort"
 	"strconv"
 	"strings"
 	"time"
@@ -212,6 +213,59 @@ func writeFileSync(path string, data []byte) error {
 		return fmt.Errorf("close %s: %w", path, err)
 	}
 	return nil
+}
+
+// Notified returns the keys lares has already surfaced.
+//
+// A missing file is an empty set. A file that does not parse is quarantined and
+// read as empty, so a damaged cache costs one repeated notice instead of a
+// failed pass. The quarantine keeps the evidence of the damage.
+func (s *Store) Notified() (map[string]bool, error) {
+	keys := make(map[string]bool)
+	data, err := os.ReadFile(s.notifiedPath())
+	if err != nil {
+		if errors.Is(err, fs.ErrNotExist) {
+			return keys, nil
+		}
+		return nil, fmt.Errorf("read notified set: %w", err)
+	}
+	var notified Notified
+	if err := json.Unmarshal(data, &notified); err != nil {
+		quarantine := s.notifiedPath() + ".corrupt-" + strconv.FormatInt(time.Now().UnixNano(), 10)
+		if renameErr := os.Rename(s.notifiedPath(), quarantine); renameErr != nil {
+			return nil, fmt.Errorf("quarantine notified set: %w", renameErr)
+		}
+		return keys, nil
+	}
+	for _, key := range notified.Keys {
+		keys[key] = true
+	}
+	return keys, nil
+}
+
+// SaveNotified replaces the dedupe set atomically. Keys are sorted, so the same
+// set always renders the same file.
+func (s *Store) SaveNotified(keys map[string]bool) error {
+	list := make([]string, 0, len(keys))
+	for key := range keys {
+		list = append(list, key)
+	}
+	sort.Strings(list)
+
+	data, err := json.Marshal(Notified{Keys: list})
+	if err != nil {
+		return fmt.Errorf("encode notified set: %w", err)
+	}
+	data = append(data, '\n')
+
+	tmp := s.notifiedPath() + ".tmp"
+	if err := writeFileSync(tmp, data); err != nil {
+		return err
+	}
+	if err := os.Rename(tmp, s.notifiedPath()); err != nil {
+		return fmt.Errorf("replace notified set: %w", err)
+	}
+	return syncdir(s.dir)
 }
 
 // Holds returns the live holds and deletes the rest.

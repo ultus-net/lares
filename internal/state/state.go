@@ -1,9 +1,10 @@
 // Package state owns everything lares writes to disk.
 //
-// Four files live in one directory:
+// The state directory holds:
 //
 //	verdicts.jsonl         append-only, one record per measure or deferral
 //	queue.json             items awaiting judgement, plus queue.json.bak
+//	notified.json          the findings already surfaced to a person
 //	holds/<owner>.json     one file per live hold
 //	runs/<item>-<date>.log one run log per item per day
 //	lock                   the interprocess lock a pass and a reboot share
@@ -72,6 +73,13 @@ type Item struct {
 type Queue struct {
 	Generation int    `json:"generation"`
 	Items      []Item `json:"items"`
+}
+
+// Notified is the notification dedupe file. Each key is an item id, its state,
+// and its detail, so the same failure is surfaced once and a changed detail is
+// surfaced again.
+type Notified struct {
+	Keys []string `json:"keys"`
 }
 
 // Hold is one process's declaration that a reboot or disruptive repair must
@@ -215,6 +223,11 @@ func (s *Store) queuePath() string {
 // backupPath returns the queue backup path.
 func (s *Store) backupPath() string {
 	return filepath.Join(s.dir, "queue.json.bak")
+}
+
+// notifiedPath returns the notification dedupe path.
+func (s *Store) notifiedPath() string {
+	return filepath.Join(s.dir, "notified.json")
 }
 
 // syncdir makes a rename durable by syncing the directory that holds it.

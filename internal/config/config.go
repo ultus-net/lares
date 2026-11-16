@@ -1,11 +1,12 @@
 // Package config loads lares' top-level configuration.
 //
 // The file names an optional external probe, the state and config directories,
-// the repositories to check, an optional adapter override, the resync interval,
-// and the local-clock window in which a disruptive repair or a reboot may run. A
-// pass evaluates the reboot gate unless reboot_from_pass is false. There is no
-// host name and no machine-specific path in the defaults: lares measures the
-// host in-process and needs no checkout.
+// the repositories to check, an optional adapter override, the channel a new
+// finding is surfaced on, the resync interval, and the local-clock window in
+// which a disruptive repair or a reboot may run. A pass evaluates the reboot
+// gate unless reboot_from_pass is false. There is no host name and no
+// machine-specific path in the defaults: lares measures the host in-process and
+// needs no checkout.
 //
 // Load and Validate both leave Resync and Window set and parsed, so a caller
 // never reads ResyncText, WindowStart, or WindowEnd. Validate has a pointer
@@ -49,10 +50,24 @@ type Config struct {
 	WindowStart     string        `toml:"window_start"`
 	WindowEnd       string        `toml:"window_end"`
 	ResyncText      string        `toml:"resync"`
+	Notify          string        `toml:"notify"`
 	RebootFromPass  bool          `toml:"reboot_from_pass"`
 	Resync          time.Duration `toml:"-"`
 	Window          Window        `toml:"-"`
 }
+
+// The notification modes config.Notify accepts.
+const (
+	// NotifyAuto prints every notice and adds a desktop notification when a
+	// session exists.
+	NotifyAuto = "auto"
+	// NotifyDesktop sends a desktop notification only, when a session exists.
+	NotifyDesktop = "desktop"
+	// NotifyStdout prints every notice and never opens a desktop channel.
+	NotifyStdout = "stdout"
+	// NotifyOff surfaces nothing.
+	NotifyOff = "off"
+)
 
 // Default returns the configuration used when no file exists.
 //
@@ -68,6 +83,7 @@ func Default() Config {
 		WindowStart:    "02:00",
 		WindowEnd:      "05:00",
 		Window:         Window{Start: "02:00", End: "05:00"},
+		Notify:         NotifyAuto,
 		RebootFromPass: true,
 	}
 }
@@ -191,6 +207,14 @@ func (c *Config) Validate() error {
 	}
 	if c.ConfigDir == "" {
 		return &ValidationError{Field: "config_dir", Detail: "must be non-empty"}
+	}
+	if c.Notify == "" {
+		c.Notify = NotifyAuto
+	}
+	switch c.Notify {
+	case NotifyAuto, NotifyDesktop, NotifyStdout, NotifyOff:
+	default:
+		return &ValidationError{Field: "notify", Detail: `must be "auto", "desktop", "stdout", or "off"`}
 	}
 	c.Resync = resync
 	c.Window = Window{Start: c.WindowStart, End: c.WindowEnd}
