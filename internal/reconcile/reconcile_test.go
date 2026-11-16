@@ -1008,6 +1008,25 @@ func TestStatusReadsQueueHoldsAndVerdicts(t *testing.T) {
 	}
 }
 
+// TestStatusDoesNotPruneHolds proves a status read leaves a dead hold on disk:
+// only a pass holds the lock and owns the cleanup.
+func TestStatusDoesNotPruneHolds(t *testing.T) {
+	h := newHarness(t)
+	if err := h.store.AddHold(state.Hold{Owner: "dead", PID: 1 << 30, Start: fixedNow}); err != nil {
+		t.Fatal(err)
+	}
+	status, err := h.engine.Status()
+	if err != nil {
+		t.Fatalf("Status: %v", err)
+	}
+	if len(status.Holds) != 0 {
+		t.Errorf("holds %v, want only live holds", status.Holds)
+	}
+	if _, err := os.Stat(filepath.Join(h.stateDir, "holds", "dead.json")); err != nil {
+		t.Errorf("Status removed a hold: %v", err)
+	}
+}
+
 func TestStatusHidesDeferralsFromVerdicts(t *testing.T) {
 	h := newHarness(t, []contract.Record{summary(contract.Live)})
 	if err := h.store.AppendVerdict(state.Verdict{ID: "offsite", State: "not-live", At: fixedNow}); err != nil {

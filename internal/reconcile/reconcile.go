@@ -592,15 +592,23 @@ type Status struct {
 }
 
 // Status reads the current state for the CLI and the TUI. A deferral is not a
-// measurement, so it never replaces the newest verdict.
+// measurement, so it never replaces the newest verdict. It never prunes a hold:
+// the pass owns that cleanup, and a status read must not remove a hold that a
+// writer is publishing.
 func (e *Engine) Status() (Status, error) {
 	queue, _, err := e.store.Queue()
 	if err != nil && !errors.Is(err, state.ErrNoQueue) {
 		return Status{}, err
 	}
-	holds, err := e.store.Holds()
+	all, err := e.store.HoldsIncludingStale()
 	if err != nil {
 		return Status{}, err
+	}
+	holds := make([]state.Hold, 0, len(all))
+	for _, hold := range all {
+		if !hold.Stale {
+			holds = append(holds, hold)
+		}
 	}
 	verdicts, err := e.store.Verdicts()
 	if err != nil {
