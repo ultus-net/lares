@@ -155,6 +155,8 @@ All notable changes to this project are recorded here. The format follows
 - The dotfiles coupling: `repo_dir`, the `LARES_REPO` environment variable, and
   the `--repo` flag. lares no longer reads a checkout to find a probe or a
   repair.
+- A PR body scratch file that the #3 merge committed by accident. `.prbody-*`
+  and `.tmp-*` are ignored so local scratch cannot land again.
 - The `hygiene-audit.sh` probe as the default measurement, and the
   `install/profile-select.sh` repair as the safe set.
 - Sudoers generation. The installer never asks for a standing grant, so a

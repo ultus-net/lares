@@ -1,3 +1,5 @@
 /lares
 /dist/
 /.e2e/
+.prbody-*
+.tmp-*
