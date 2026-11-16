@@ -55,13 +55,11 @@ Commands:
   version                    print the version
 
 Flags:
-  --repo <dir>      dotfiles checkout holding the probe (also LARES_REPO)
   --config <path>   config file (default $XDG_CONFIG_HOME/lares/config.toml)
 `, version)
 }
 
 func main() {
-	repoFlag := flag.String("repo", "", "dotfiles checkout holding the probe (also LARES_REPO)")
 	configFlag := flag.String("config", "", "config file path")
 	versionFlag := flag.Bool("version", false, "print the version")
 
@@ -77,11 +75,7 @@ func main() {
 		os.Exit(2)
 	}
 
-	dir := *repoFlag
-	if dir == "" {
-		dir = os.Getenv("LARES_REPO")
-	}
-	a := &app{repoDir: dir, configPath: *configFlag}
+	a := &app{configPath: *configFlag}
 
 	ctx := context.Background()
 	switch cmd := flag.Arg(0); cmd {
@@ -112,7 +106,6 @@ func main() {
 
 // app carries the parsed global flags between commands.
 type app struct {
-	repoDir    string
 	configPath string
 
 	loaded bool
@@ -143,17 +136,6 @@ func (a *app) load() error {
 	}
 	a.cfg = cfg
 
-	if a.repoDir == "" {
-		a.repoDir = cfg.RepoDir
-	}
-	if a.repoDir == "" {
-		wd, err := os.Getwd()
-		if err != nil {
-			return fmt.Errorf("read working directory: %w", err)
-		}
-		a.repoDir = wd
-	}
-
 	store, err := state.Open(cfg.StateDir)
 	if err != nil {
 		return fmt.Errorf("open state: %w", err)
@@ -179,15 +161,6 @@ func (a *app) load() error {
 	return nil
 }
 
-// probe returns the audit argv, with a relative script anchored at the repo.
-func (a *app) probe() []string {
-	argv := append([]string(nil), a.cfg.AuditCommand...)
-	if len(argv) > 1 && !filepath.IsAbs(argv[1]) && a.repoDir != "" {
-		argv[1] = filepath.Join(a.repoDir, argv[1])
-	}
-	return argv
-}
-
 // engine builds a reconcile engine over the loaded state.
 func (a *app) engine() (*reconcile.Engine, error) {
 	if err := a.load(); err != nil {
@@ -198,11 +171,10 @@ func (a *app) engine() (*reconcile.Engine, error) {
 		Store:    a.store,
 		Family:   a.family,
 		Adapters: a.table,
-		RepoDir:  a.repoDir,
 	})
 }
 
-// measure runs the probe once, prints every record, and appends a verdict per
+// measure runs one measurement, prints every record, and appends a verdict per
 // non-summary record.
 func (a *app) measure(ctx context.Context, args []string) {
 	fset := flag.NewFlagSet("measure", flag.ExitOnError)
@@ -210,7 +182,8 @@ func (a *app) measure(ctx context.Context, args []string) {
 	if err := fset.Parse(args); err != nil {
 		os.Exit(2)
 	}
-	if err := a.load(); err != nil {
+	engine, err := a.engine()
+	if err != nil {
 		fmt.Fprintf(os.Stderr, "measure: %v\n", err)
 		os.Exit(3)
 	}
@@ -219,9 +192,9 @@ func (a *app) measure(ctx context.Context, args []string) {
 	defer cancel()
 
 	var records []contract.Record
-	err := a.withLock(func() error {
+	err = a.withLock(func() error {
 		var err error
-		records, err = contract.MeasureIn(ctx, a.repoDir, a.probe())
+		records, err = engine.Measure(ctx)
 		if err != nil {
 			return err
 		}
@@ -601,7 +574,6 @@ func (a *app) install(args []string) {
 		os.Exit(3)
 	}
 	cfg := a.cfg
-	cfg.RepoDir = a.repoDir
 	written, err := install.Install(install.Options{
 		HomeDir:    home,
 		BinaryPath: self,

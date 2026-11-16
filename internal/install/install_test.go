@@ -205,7 +205,8 @@ func TestInstallRejectsMissingBinary(t *testing.T) {
 func TestConfigTOMLRoundTrips(t *testing.T) {
 	home := t.TempDir()
 	cfg := testConfig(t, home)
-	cfg.RepoDir = "/home/tester/dotfiles"
+	cfg.ReposDir = "/home/tester/src"
+	cfg.Repos = []string{"/home/tester/src/a"}
 	cfg.AdapterOverride = "arch"
 	cfg.WindowStart = "23:30"
 	cfg.WindowEnd = "01:15"
@@ -224,8 +225,11 @@ func TestConfigTOMLRoundTrips(t *testing.T) {
 	if got.StateDir != cfg.StateDir || got.ConfigDir != cfg.ConfigDir {
 		t.Errorf("dirs %q %q, want %q %q", got.StateDir, got.ConfigDir, cfg.StateDir, cfg.ConfigDir)
 	}
-	if got.RepoDir != "/home/tester/dotfiles" {
-		t.Errorf("repo dir %q", got.RepoDir)
+	if got.ReposDir != "/home/tester/src" {
+		t.Errorf("repos dir %q", got.ReposDir)
+	}
+	if strings.Join(got.Repos, ",") != "/home/tester/src/a" {
+		t.Errorf("repos %v", got.Repos)
 	}
 	if got.RebootFromPass {
 		t.Error("reboot_from_pass = false did not survive the round trip")
@@ -283,20 +287,17 @@ func TestAdaptersTOMLEmptyIsHeaderOnly(t *testing.T) {
 }
 
 func TestServiceUnit(t *testing.T) {
-	body := ServiceUnit("/home/tester/dotfiles")
+	body := ServiceUnit()
 	for _, want := range []string{
 		"Type=oneshot",
 		"ExecStart=%h/.local/bin/lares pass",
 		"Nice=10",
 		"IOSchedulingClass=idle",
-		"WorkingDirectory=/home/tester/dotfiles",
+		"WorkingDirectory=%h",
 	} {
 		if !strings.Contains(body, want) {
 			t.Errorf("service unit missing %q:\n%s", want, body)
 		}
-	}
-	if strings.Contains(ServiceUnit(""), "WorkingDirectory") {
-		t.Error("an empty repo dir still wrote WorkingDirectory")
 	}
 }
 

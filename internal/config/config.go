@@ -1,10 +1,11 @@
 // Package config loads lares' top-level configuration.
 //
-// The file names the probe command, the checkout that holds it, the state and
-// config directories, an optional adapter override, the resync interval, and
-// the local-clock window in which a disruptive repair or a reboot may run. A
+// The file names an optional external probe, the state and config directories,
+// the repositories to check, an optional adapter override, the resync interval,
+// and the local-clock window in which a disruptive repair or a reboot may run. A
 // pass evaluates the reboot gate unless reboot_from_pass is false. There is no
-// host name and no machine-specific path in the defaults.
+// host name and no machine-specific path in the defaults: lares measures the
+// host in-process and needs no checkout.
 //
 // Load and Validate both leave Resync and Window set and parsed, so a caller
 // never reads ResyncText, WindowStart, or WindowEnd. Validate has a pointer
@@ -36,9 +37,13 @@ type Window struct {
 
 // Config is the whole configuration file.
 type Config struct {
-	AuditCommand    []string      `toml:"audit_command"`
-	StateDir        string        `toml:"state_dir"`
-	ConfigDir       string        `toml:"config_dir"`
+	AuditCommand []string `toml:"audit_command"`
+	StateDir     string   `toml:"state_dir"`
+	ConfigDir    string   `toml:"config_dir"`
+	ReposDir     string   `toml:"repos_dir"`
+	Repos        []string `toml:"repos"`
+	// RepoDir is accepted but ignored. It was the dotfiles checkout that held
+	// the probe before the in-process engine, so an older config still loads.
 	RepoDir         string        `toml:"repo_dir"`
 	AdapterOverride string        `toml:"adapter_override"`
 	WindowStart     string        `toml:"window_start"`
@@ -65,12 +70,13 @@ const (
 
 // Default returns the configuration used when no file exists.
 //
-// The probe is ["bash", "install/lib/hygiene-audit.sh"], the resync interval is
-// 15 minutes, the window is 02:00-05:00, and a pass evaluates the reboot gate.
-// StateDir and ConfigDir are empty until Load fills them from the XDG defaults.
+// There is no probe command: lares measures in-process. A non-empty
+// audit_command replaces the built-in measurement with an external probe and
+// queues every record it prints. The resync interval is 15 minutes, the window
+// is 02:00-05:00, and a pass evaluates the reboot gate. StateDir, ConfigDir, and
+// ReposDir are empty until Load fills them from the XDG defaults and HOME.
 func Default() Config {
 	return Config{
-		AuditCommand:   []string{"bash", "install/lib/hygiene-audit.sh"},
 		ResyncText:     "15m",
 		Resync:         15 * time.Minute,
 		WindowStart:    "02:00",
@@ -115,7 +121,8 @@ func Load(path string) (Config, error) {
 	return cfg, nil
 }
 
-// ensureDirs fills StateDir and ConfigDir when the file left them empty.
+// ensureDirs fills StateDir, ConfigDir, and ReposDir when the file left them
+// empty.
 func (c *Config) ensureDirs() error {
 	if c.StateDir == "" {
 		dir, err := DefaultStateDir()
@@ -130,6 +137,11 @@ func (c *Config) ensureDirs() error {
 			return err
 		}
 		c.ConfigDir = filepath.Dir(path)
+	}
+	if c.ReposDir == "" {
+		if home, err := os.UserHomeDir(); err == nil {
+			c.ReposDir = filepath.Join(home, "Documents", "projects")
+		}
 	}
 	return nil
 }
@@ -164,9 +176,17 @@ func DefaultStateDir() (string, error) {
 
 // Validate parses ResyncText and the window, checks every required value, and
 // writes Resync and Window.
+//
+// audit_command is optional: empty means the in-process measure engine. When
+// set it must name a program, and each repos entry must be non-empty.
 func (c *Config) Validate() error {
-	if len(c.AuditCommand) == 0 || c.AuditCommand[0] == "" {
+	if len(c.AuditCommand) > 0 && c.AuditCommand[0] == "" {
 		return &ValidationError{Field: "audit_command", Detail: "must name a program"}
+	}
+	for i, repo := range c.Repos {
+		if repo == "" {
+			return &ValidationError{Field: "repos", Detail: fmt.Sprintf("entry %d is empty", i)}
+		}
 	}
 	resync, err := time.ParseDuration(c.ResyncText)
 	if err != nil {

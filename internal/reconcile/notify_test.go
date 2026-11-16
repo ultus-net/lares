@@ -10,6 +10,7 @@ import (
 
 	"github.com/ultus-net/lares/internal/config"
 	"github.com/ultus-net/lares/internal/contract"
+	"github.com/ultus-net/lares/internal/term"
 )
 
 // needsOperator is a record only a person may repair.
@@ -162,9 +163,9 @@ func TestPassSurfacesAFindingAgainAfterItClears(t *testing.T) {
 	}
 }
 
-func TestPassMarksAnEscalationUrgent(t *testing.T) {
+func TestPassMarksADidNotHoldFindingUrgent(t *testing.T) {
 	h := newHarnessWith(t, harnessOptions{notify: config.NotifyDesktop},
-		[]contract.Record{rec("profile", contract.NotLive, "install/profile.sh"), summary(contract.NotLive)},
+		[]contract.Record{rec("repo-demo", contract.NotLive, "git fetch origin"), summary(contract.NotLive)},
 	)
 	h.session = true
 
@@ -172,14 +173,14 @@ func TestPassMarksAnEscalationUrgent(t *testing.T) {
 	if err != nil {
 		t.Fatalf("Pass: %v", err)
 	}
-	if len(result.Escalated) != 1 || result.Escalated[0] != "profile" {
-		t.Fatalf("escalated %v, want profile", result.Escalated)
+	if len(result.Escalated) != 1 || result.Escalated[0] != "repo-demo" {
+		t.Fatalf("escalated %v, want repo-demo: the repair did not hold", result.Escalated)
 	}
 	if len(h.notified) != 1 {
 		t.Fatalf("desktop notices %d, want 1", len(h.notified))
 	}
 	if !h.notified[0].Urgent {
-		t.Error("an escalation was not marked urgent")
+		t.Error("a repair that did not hold was not marked urgent")
 	}
 
 	again, err := h.engine.Pass(context.Background())
@@ -299,7 +300,7 @@ func TestPassDesktopModeRetriesAFailedSend(t *testing.T) {
 }
 
 func TestNoticeStaysOnOneLine(t *testing.T) {
-	got := noticeFor(contract.Record{ID: "offsite", State: contract.NotLive, Detail: "first\nsecond"}, termNeedsOperator)
+	got := noticeFor(contract.Record{ID: "offsite", State: contract.NotLive, Detail: "first\nsecond"}, term.NeedsOperator)
 	if strings.Contains(got.Line, "\n") {
 		t.Errorf("notice line %q holds a newline", got.Line)
 	}

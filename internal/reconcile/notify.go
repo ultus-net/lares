@@ -10,6 +10,7 @@ import (
 	"github.com/ultus-net/lares/internal/config"
 	"github.com/ultus-net/lares/internal/contract"
 	"github.com/ultus-net/lares/internal/state"
+	"github.com/ultus-net/lares/internal/term"
 )
 
 // notice is one finding lares has not surfaced yet.
@@ -26,7 +27,7 @@ type notice struct {
 }
 
 // noticeFor turns a queued record into a notice.
-func noticeFor(rec contract.Record, term string) notice {
+func noticeFor(rec contract.Record, itemTerm string) notice {
 	body := rec.Detail
 	if body == "" {
 		body = string(rec.State)
@@ -39,7 +40,7 @@ func noticeFor(rec contract.Record, term string) notice {
 		Title:  "lares: " + rec.ID,
 		Body:   body,
 		Line:   fmt.Sprintf("lares: %s %s: %s", rec.ID, rec.State, oneLine(body)),
-		Urgent: term == termDidNotHold,
+		Urgent: itemTerm == term.DidNotHold,
 	}
 }
 

@@ -10,8 +10,8 @@ import (
 
 func TestDefault(t *testing.T) {
 	cfg := Default()
-	if got := strings.Join(cfg.AuditCommand, " "); got != "bash install/lib/hygiene-audit.sh" {
-		t.Errorf("audit command %q", got)
+	if len(cfg.AuditCommand) != 0 {
+		t.Errorf("audit command %q, want empty so the host is measured in-process", cfg.AuditCommand)
 	}
 	if cfg.Resync != 15*time.Minute {
 		t.Errorf("resync %v, want 15m", cfg.Resync)
@@ -25,8 +25,8 @@ func TestDefault(t *testing.T) {
 	if cfg.Notify != NotifyAuto {
 		t.Errorf("notify %q, want %q", cfg.Notify, NotifyAuto)
 	}
-	if cfg.RepoDir != "" {
-		t.Errorf("repo dir %q, want empty", cfg.RepoDir)
+	if cfg.ReposDir != "" || len(cfg.Repos) != 0 {
+		t.Errorf("repos should be empty until Load: %q %v", cfg.ReposDir, cfg.Repos)
 	}
 	if cfg.StateDir != "" || cfg.ConfigDir != "" {
 		t.Errorf("dirs should be empty until Load: %q %q", cfg.StateDir, cfg.ConfigDir)
@@ -36,6 +36,7 @@ func TestDefault(t *testing.T) {
 func TestLoadMissingFileUsesDefaults(t *testing.T) {
 	t.Setenv("XDG_STATE_HOME", "/tmp/state-home")
 	t.Setenv("XDG_CONFIG_HOME", "/tmp/config-home")
+	t.Setenv("HOME", "/home/tester")
 	cfg, err := Load(filepath.Join(t.TempDir(), "absent.toml"))
 	if err != nil {
 		t.Fatalf("Load: %v", err)
@@ -45,6 +46,9 @@ func TestLoadMissingFileUsesDefaults(t *testing.T) {
 	}
 	if cfg.ConfigDir != "/tmp/config-home/lares" {
 		t.Errorf("config dir %q", cfg.ConfigDir)
+	}
+	if cfg.ReposDir != "/home/tester/Documents/projects" {
+		t.Errorf("repos dir %q", cfg.ReposDir)
 	}
 	if cfg.Resync != 15*time.Minute {
 		t.Errorf("resync %v", cfg.Resync)
@@ -58,7 +62,8 @@ func TestLoadFile(t *testing.T) {
 audit_command = ["bash", "/opt/audit.sh"]
 state_dir = "/var/lib/lares"
 config_dir = "/etc/lares"
-repo_dir = "/home/tester/dotfiles"
+repos_dir = "/home/tester/src"
+repos = ["/home/tester/src/a", "/home/tester/src/b"]
 adapter_override = "arch"
 window_start = "23:30"
 window_end = "01:15"
@@ -75,8 +80,11 @@ reboot_from_pass = false
 	if cfg.Resync != 2*time.Hour {
 		t.Errorf("resync %v", cfg.Resync)
 	}
-	if cfg.RepoDir != "/home/tester/dotfiles" {
-		t.Errorf("repo dir %q", cfg.RepoDir)
+	if cfg.ReposDir != "/home/tester/src" {
+		t.Errorf("repos dir %q", cfg.ReposDir)
+	}
+	if got := strings.Join(cfg.Repos, ","); got != "/home/tester/src/a,/home/tester/src/b" {
+		t.Errorf("repos %q", got)
 	}
 	if cfg.RebootFromPass {
 		t.Error("reboot_from_pass = false was ignored")
@@ -108,6 +116,21 @@ func TestLoadEmptyFileUsesDefaults(t *testing.T) {
 	}
 }
 
+func TestLoadAcceptsRemovedRepoDir(t *testing.T) {
+	t.Setenv("XDG_STATE_HOME", "/tmp/state-home")
+	t.Setenv("XDG_CONFIG_HOME", "/tmp/config-home")
+	path := filepath.Join(t.TempDir(), "config.toml")
+	body := "audit_command = [\"bash\"]\nrepo_dir = \"/old/dotfiles\"\n"
+	if err := os.WriteFile(path, []byte(body), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	// An older config still starts. repo_dir is accepted and ignored, so an
+	// upgrade never turns the timer into a loud unknown-key failure.
+	if _, err := Load(path); err != nil {
+		t.Fatalf("Load: %v", err)
+	}
+}
+
 func TestLoadRejects(t *testing.T) {
 	tests := []struct {
 		name string
@@ -121,9 +144,9 @@ func TestLoadRejects(t *testing.T) {
 		{"empty resync", "resync = \"\"\n", "resync"},
 		{"bad window start", "window_start = \"2:00\"\n", "window_start"},
 		{"bad window end", "window_end = \"25:00\"\n", "window_end"},
-		{"empty audit command", "audit_command = []\n", "audit_command"},
 		{"empty program", "audit_command = [\"\"]\n", "audit_command"},
 		{"bad notify mode", "notify = \"carrier-pigeon\"\n", "notify"},
+		{"empty repos entry", "repos = [\"/a\", \"\"]\n", "repos"},
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
