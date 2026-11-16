@@ -432,13 +432,19 @@ func (a *app) holdAdd(args []string) {
 // startProcess starts cmd. Tests replace it to observe the lock ordering.
 var startProcess = func(cmd *exec.Cmd) error { return cmd.Start() }
 
+// waitProcess reaps cmd. Tests replace it to observe the lock state at the reap.
+var waitProcess = func(cmd *exec.Cmd) error { return cmd.Wait() }
+
 // startUnderLock starts cmd while the state lock is held, then publishes the
 // hold that names the started pid, and only then releases the lock.
 //
 // A pass that holds the lock therefore never runs between the command's start
 // and its hold, and a pass already running makes this refuse before the command
 // exists. A command whose hold cannot be written is killed under the same lock,
-// so no pass can observe it running unheld.
+// so no pass can observe it running unheld. The kill is signalled before the
+// unlock and the corpse is reaped after it, because a process stuck in
+// uninterruptible I/O can delay the reap and would otherwise stall every lock
+// user.
 func (a *app) startUnderLock(cmd *exec.Cmd, reason string) (state.Hold, error) {
 	if err := a.store.Lock(); err != nil {
 		return state.Hold{}, err
@@ -453,9 +459,11 @@ func (a *app) startUnderLock(cmd *exec.Cmd, reason string) (state.Hold, error) {
 	addErr := a.store.AddHold(hold)
 	if addErr != nil {
 		_ = cmd.Process.Kill()
-		_ = cmd.Wait()
 	}
 	_ = a.store.Unlock()
+	if addErr != nil {
+		_ = waitProcess(cmd)
+	}
 	return hold, addErr
 }
 

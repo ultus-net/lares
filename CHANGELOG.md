@@ -171,6 +171,9 @@ All notable changes to this project are recorded here. The format follows
   hold, then releases the lock. A pass that already holds the lock makes
   `hold exec` refuse before the command exists, so a repair or reboot can no
   longer run over the command in the unprotected interval before its hold.
+- When `hold exec` cannot write its hold, it kills the child under the lock and
+  reaps it after releasing the lock. A process stuck in uninterruptible I/O can
+  delay the reap, and reaping under the lock would stall every lock user.
 - A hold is written atomically: a temp file, an fsync, a rename, and a
   directory fsync. A crash can no longer leave a torn hold that a later pass
   treats as stale and deletes while the process it protects is still running.
