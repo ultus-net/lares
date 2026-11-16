@@ -359,6 +359,31 @@ activate = ["systemctl", "reboot"]
 Detection order is Arch first, then Fedora with `bootc` present, then Fedora with
 `rpm-ostree` present. A host that names neither measures and never acts.
 
+The family also decides who stages an update. On Arch the `patch-train` timer
+runs the stage verb itself. On Fedora atomic and bootc the stage verb needs
+root, and lares holds no grant, so lares never runs it. The `patch-train` queue
+item carries the exact command instead, under the `needs-grant` term:
+
+```text
+rpm-ostree upgrade
+bootc upgrade
+```
+
+Run that command with root, then reboot in a window.
+
+A staged deployment clears the item. Fedora atomic asks
+`rpm-ostree status --json` for a deployment with `staged` true. Bootc asks
+`bootc status --json` for a non-null `status.staged`. The record then reports
+`live` with the detail `staged deployment waits for reboot`. If the status
+command fails, or prints a layout lares does not know, the item stays queued and
+its detail names the error. A check that cannot see the deployment never reports
+it staged.
+
+After a reboot the staged deployment becomes the booted one, so the probe again
+reports no patch-train timer and the item returns on the next pass. On Fedora the
+item is a standing reminder to stage an update, not a one-shot task. Defer it
+when an update is not wanted.
+
 `config.toml`'s `adapter_override` names a section when detection is wrong.
 `repos_dir` is the directory whose immediate children are checked, and `repos`
 replaces discovery with an explicit list. `reboot_from_pass` (default true)

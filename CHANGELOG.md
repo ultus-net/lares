@@ -103,6 +103,11 @@ All notable changes to this project are recorded here. The format follows
   records `repos_dir` instead of a checkout.
 - Convergence requires a verification measurement that names the item and says
   `live`. A missing record and an `unknown` record both leave the item queued.
+- On Fedora atomic and bootc the `patch-train` item names the adapter's stage
+  command (`rpm-ostree upgrade` or `bootc upgrade`) instead of a repair lares
+  never runs. A staged deployment, read from `rpm-ostree status --json` or
+  `bootc status --json`, reports the item live and clears it. A failed or
+  unparsable status keeps the item queued and names the error.
 - The reboot gate fails closed when the session state or the update train state
   cannot be read, and names a long-horizon process with no hold as `unclaimed`.
   A bootc host counts a running `rpm-ostree` as well as a running `bootc`, so a

@@ -65,6 +65,13 @@ func (f fakeRepairer) Repair(_ context.Context, rec contract.Record) (string, er
 	return "converged\n", nil
 }
 
+// harnessOptions names what a test overrides in the default harness.
+type harnessOptions struct {
+	family   adapter.Family
+	adapters map[adapter.Family]adapter.Adapter
+	staged   func(context.Context) (bool, error)
+}
+
 // newHarness builds an engine whose probe returns the scripted measurements in
 // order, repeating the last one.
 //
@@ -72,6 +79,19 @@ func (f fakeRepairer) Repair(_ context.Context, rec contract.Record) (string, er
 // test that wants the gate sets cfg.RebootFromPass and an adapter.
 func newHarness(t *testing.T, script ...[]contract.Record) *harness {
 	t.Helper()
+	return newHarnessWith(t, harnessOptions{}, script...)
+}
+
+// newHarnessWith is newHarness with the family, adapters, and staged check
+// replaced, for tests that exercise the Fedora staging policy.
+func newHarnessWith(t *testing.T, opts harnessOptions, script ...[]contract.Record) *harness {
+	t.Helper()
+	if opts.family == "" {
+		opts.family = adapter.Arch
+	}
+	if opts.staged == nil {
+		opts.staged = func(context.Context) (bool, error) { return false, nil }
+	}
 	dir := t.TempDir()
 	store, err := state.Open(dir)
 	if err != nil {
@@ -82,7 +102,8 @@ func newHarness(t *testing.T, script ...[]contract.Record) *harness {
 	engine, err := New(Options{
 		Config:   testConfig(dir, false),
 		Store:    store,
-		Family:   adapter.Arch,
+		Family:   opts.family,
+		Adapters: opts.adapters,
 		Now:      func() time.Time { return fixedNow },
 		Repairer: fakeRepairer{h: h},
 		Measure: func(context.Context) ([]contract.Record, error) {
@@ -102,6 +123,7 @@ func newHarness(t *testing.T, script ...[]contract.Record) *harness {
 		},
 		Session: func(context.Context) (bool, error) { return h.session, nil },
 		Train:   func(context.Context) (bool, error) { return h.train, nil },
+		Staged:  opts.staged,
 		Agents:  func() ([]Agent, error) { return nil, nil },
 		Activate: func(_ context.Context, argv []string) error {
 			h.activations = append(h.activations, argv)

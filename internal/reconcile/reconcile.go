@@ -65,6 +65,7 @@ type Options struct {
 	Sleep    func(ctx context.Context, d time.Duration) error
 	Session  func(ctx context.Context) (bool, error)
 	Train    func(ctx context.Context) (bool, error)
+	Staged   func(ctx context.Context) (bool, error)
 	Agents   func() ([]Agent, error)
 	Activate func(ctx context.Context, argv []string) error
 }
@@ -82,6 +83,7 @@ type Engine struct {
 	sleep    func(ctx context.Context, d time.Duration) error
 	session  func(ctx context.Context) (bool, error)
 	train    func(ctx context.Context) (bool, error)
+	staged   func(ctx context.Context) (bool, error)
 	agents   func() ([]Agent, error)
 	activate func(ctx context.Context, argv []string) error
 }
@@ -116,6 +118,7 @@ func New(opts Options) (*Engine, error) {
 		sleep:    opts.Sleep,
 		session:  opts.Session,
 		train:    opts.Train,
+		staged:   opts.Staged,
 		agents:   opts.Agents,
 		activate: opts.Activate,
 	}
@@ -160,6 +163,9 @@ func New(opts Options) (*Engine, error) {
 	}
 	if e.train == nil {
 		e.train = func(ctx context.Context) (bool, error) { return defaultTrainRunning(ctx, e.family) }
+	}
+	if e.staged == nil {
+		e.staged = func(ctx context.Context) (bool, error) { return defaultStaged(ctx, e.family) }
 	}
 	if e.agents == nil {
 		e.agents = defaultAgents
@@ -221,6 +227,10 @@ func (e *Engine) Pass(ctx context.Context) (Result, error) {
 	records, err := e.measure(ctx)
 	if err != nil {
 		return Result{}, fmt.Errorf("measure: %w", err)
+	}
+	records, err = e.stageRecords(ctx, records)
+	if err != nil {
+		return Result{}, fmt.Errorf("stage policy: %w", err)
 	}
 	result := Result{Measured: records}
 	if err := e.record(records, now); err != nil {
