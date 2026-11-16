@@ -439,27 +439,48 @@ func TestStartUnderLockRefusesBeforeStartingWhenTheLockIsHeld(t *testing.T) {
 	}
 }
 
-// TestStartUnderLockKillsTheCommandWhenTheHoldCannotBeWritten proves the
-// failure path leaves no command running unheld and releases the lock.
+// TestStartUnderLockKillsTheCommandWhenTheHoldCannotBeWritten proves the failure
+// path leaves no command running unheld, releases the lock before reaping, and
+// still reports a kill signal.
+//
+// A regular file at the holds directory makes AddHold fail with ENOTDIR, so the
+// case is deterministic and does not depend on the uid or on chmod.
 func TestStartUnderLockKillsTheCommandWhenTheHoldCannotBeWritten(t *testing.T) {
-	if os.Geteuid() == 0 {
-		t.Skip("a read-only directory does not stop root")
-	}
 	c := newCLI(t)
 	store, err := state.Open(c.state)
 	if err != nil {
 		t.Fatalf("open state: %v", err)
 	}
-	holdsDir := filepath.Join(c.state, "holds")
-	if err := os.Chmod(holdsDir, 0o500); err != nil {
-		t.Fatalf("make holds read-only: %v", err)
+	probe, err := state.Open(c.state)
+	if err != nil {
+		t.Fatalf("open probe state: %v", err)
 	}
-	t.Cleanup(func() { _ = os.Chmod(holdsDir, 0o700) })
+	holdsDir := filepath.Join(c.state, "holds")
+	if err := os.RemoveAll(holdsDir); err != nil {
+		t.Fatalf("clear holds directory: %v", err)
+	}
+	if err := os.WriteFile(holdsDir, nil, 0o600); err != nil {
+		t.Fatalf("replace holds directory with a file: %v", err)
+	}
+
+	var atReap error
+	previousWait := waitProcess
+	waitProcess = func(cmd *exec.Cmd) error {
+		atReap = probe.Lock()
+		if atReap == nil {
+			_ = probe.Unlock()
+		}
+		return cmd.Wait()
+	}
+	t.Cleanup(func() { waitProcess = previousWait })
 
 	a := &app{store: store}
 	cmd := exec.Command("sh", "-c", "sleep 5")
 	if _, err := a.startUnderLock(cmd, "sh -c sleep 5"); err == nil {
-		t.Fatal("AddHold succeeded with a read-only holds directory")
+		t.Fatal("AddHold succeeded with the holds path replaced by a file")
+	}
+	if atReap != nil {
+		t.Errorf("the state lock was still held when the child was reaped: %v", atReap)
 	}
 	if cmd.ProcessState == nil {
 		t.Fatal("the command was not reaped after the hold failed")
@@ -469,10 +490,6 @@ func TestStartUnderLockKillsTheCommandWhenTheHoldCannotBeWritten(t *testing.T) {
 		t.Errorf("command exit %v, want a kill signal", cmd.ProcessState)
 	}
 
-	probe, err := state.Open(c.state)
-	if err != nil {
-		t.Fatalf("open a probe handle: %v", err)
-	}
 	if err := probe.Lock(); err != nil {
 		t.Errorf("the lock was left held after the failure: %v", err)
 	} else {

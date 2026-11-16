@@ -235,9 +235,12 @@ lares hold exec -- ./long-build.sh
 the command's pid, and only then releases the lock. A pass that already holds
 the lock makes `hold exec` refuse before the command exists, so no repair or
 reboot runs across the interval before a hold is published. If the hold cannot
-be written, the command is killed rather than left running unheld. The hold is
-removed when the command exits. The hold names the child rather than lares, so a
-lares crash leaves the running command protected.
+be written, the command is killed under the same lock and reaped after the
+release. The kill is signalled while the lock is held, so no pass can observe
+the command running unheld. The reap happens after the release, because a
+process stuck in uninterruptible I/O can delay it, and that delay would stall
+every lock user. The hold is removed when the command exits. The hold names the
+child rather than lares, so a lares crash leaves the running command protected.
 
 The owner is `pid-<pid>`, and a non-slug owner is rejected rather than
 rewritten, so two identities never share one file. A hold is stale when its pid
