@@ -243,6 +243,12 @@ the pid was reused. A stale hold is ignored, reported, and removed, so a crashed
 tool cannot pin the host. A permission error means the process exists under
 another user, so it keeps the hold.
 
+A hold is written to a temp file and renamed, so a reader sees the previous hold
+or the complete new one and never half a barrier. A hold file that cannot be
+read or parsed stops the pass instead of being deleted: lares never removes a
+barrier it cannot understand. Only a pass, which holds the lock, prunes a dead
+hold; `status` and `hold list` are read-only.
+
 `lares hold list` marks stale holds. `lares hold rm <owner>` removes one.
 
 A live `opencode` or `orca` process with no hold is treated as a hold, and the

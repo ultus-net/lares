@@ -316,6 +316,36 @@ func TestAddHoldReplacesSameOwner(t *testing.T) {
 	}
 }
 
+func TestAddHoldKeepsTheOldHoldWhenTheReplaceFails(t *testing.T) {
+	if os.Geteuid() == 0 {
+		t.Skip("a read-only directory does not stop root")
+	}
+	s := newStore(t)
+	stubAlive(t, func(int) bool { return true })
+	if err := s.AddHold(Hold{Owner: "worker", Reason: "first", PID: 1}); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Chmod(s.holdsDir, 0o500); err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = os.Chmod(s.holdsDir, 0o700) })
+
+	if err := s.AddHold(Hold{Owner: "worker", Reason: "second", PID: 2}); err == nil {
+		t.Fatal("AddHold replaced a hold through a read-only directory")
+	}
+	data, err := os.ReadFile(filepath.Join(s.holdsDir, "worker.json"))
+	if err != nil {
+		t.Fatalf("read the surviving hold: %v", err)
+	}
+	var got Hold
+	if err := json.Unmarshal(data, &got); err != nil {
+		t.Fatalf("a failed replace tore the old hold: %v", err)
+	}
+	if got.Reason != "first" || got.PID != 1 {
+		t.Errorf("hold %+v, want the original before the failed replace", got)
+	}
+}
+
 func TestAddHoldRejectsNonSlugOwner(t *testing.T) {
 	s := newStore(t)
 	stubAlive(t, func(int) bool { return true })
@@ -364,6 +394,9 @@ func TestHoldsRemovesStaleAndMarksStale(t *testing.T) {
 	if stale != 1 {
 		t.Errorf("got %d stale holds, want 1", stale)
 	}
+	if _, err := os.Stat(filepath.Join(s.holdsDir, "dead.json")); err != nil {
+		t.Errorf("HoldsIncludingStale removed a hold: %v", err)
+	}
 
 	live, err := s.Holds()
 	if err != nil {
@@ -377,7 +410,7 @@ func TestHoldsRemovesStaleAndMarksStale(t *testing.T) {
 	}
 }
 
-func TestHoldsUnparsableFile(t *testing.T) {
+func TestHoldsUnparsableFileFailsClosed(t *testing.T) {
 	s := newStore(t)
 	stubAlive(t, func(int) bool { return true })
 	path := filepath.Join(s.holdsDir, "broken.json")
@@ -385,23 +418,37 @@ func TestHoldsUnparsableFile(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	all, err := s.HoldsIncludingStale()
-	if err != nil {
-		t.Fatalf("HoldsIncludingStale: %v", err)
+	if _, err := s.Holds(); err == nil {
+		t.Error("Holds read an unparsable hold as absent")
 	}
-	if len(all) != 1 || !all[0].Stale || all[0].Owner != "broken" {
-		t.Fatalf("holds %+v, want one stale broken hold", all)
+	if _, err := s.HoldsIncludingStale(); err == nil {
+		t.Error("HoldsIncludingStale read an unparsable hold as absent")
 	}
+	if _, err := os.Stat(path); err != nil {
+		t.Errorf("an unparsable hold was removed: %v", err)
+	}
+}
 
-	live, err := s.Holds()
-	if err != nil {
-		t.Fatalf("Holds: %v", err)
+func TestHoldsUnreadableFileFailsClosed(t *testing.T) {
+	if os.Geteuid() == 0 {
+		t.Skip("a read-only file does not stop root")
 	}
-	if len(live) != 0 {
-		t.Errorf("got %d live holds, want 0", len(live))
+	s := newStore(t)
+	stubAlive(t, func(int) bool { return true })
+	path := filepath.Join(s.holdsDir, "secret.json")
+	if err := s.AddHold(Hold{Owner: "secret", PID: 1}); err != nil {
+		t.Fatal(err)
 	}
-	if _, err := os.Stat(path); !errors.Is(err, os.ErrNotExist) {
-		t.Error("unparsable hold file was not removed")
+	if err := os.Chmod(path, 0o000); err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = os.Chmod(path, 0o600) })
+
+	if _, err := s.Holds(); err == nil {
+		t.Error("Holds read an unreadable hold as absent")
+	}
+	if _, err := os.Stat(path); err != nil {
+		t.Errorf("an unreadable hold was removed: %v", err)
 	}
 }
 

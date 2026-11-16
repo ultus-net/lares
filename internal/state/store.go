@@ -258,29 +258,25 @@ func (s *Store) SaveNotified(keys map[string]bool) error {
 	}
 	data = append(data, '\n')
 
-	tmp := s.notifiedPath() + ".tmp"
-	if err := writeFileSync(tmp, data); err != nil {
-		return err
-	}
-	if err := os.Rename(tmp, s.notifiedPath()); err != nil {
-		return fmt.Errorf("replace notified set: %w", err)
-	}
-	return syncdir(s.dir)
+	return writeFileAtomic(s.dir, s.notifiedPath(), data)
 }
 
-// Holds returns the live holds and deletes the rest.
+// Holds returns the live holds. It deletes a hold whose process is gone, so a
+// crashed tool cannot pin the host. A hold that cannot be read or parsed is an
+// error: lares cannot prove the barrier is dead, so it fails closed.
 func (s *Store) Holds() ([]Hold, error) {
-	return s.holds(false)
-}
-
-// HoldsIncludingStale returns every hold, marking the dead ones. A hold whose
-// file does not parse is stale too.
-func (s *Store) HoldsIncludingStale() ([]Hold, error) {
 	return s.holds(true)
 }
 
-// holds lists holds, optionally keeping stale ones.
-func (s *Store) holds(includeStale bool) ([]Hold, error) {
+// HoldsIncludingStale returns every hold and marks the dead ones. It never
+// writes, so a status read cannot remove a hold that a writer is publishing.
+func (s *Store) HoldsIncludingStale() ([]Hold, error) {
+	return s.holds(false)
+}
+
+// holds lists holds. prune removes the dead ones; only a caller that holds the
+// state lock passes true.
+func (s *Store) holds(prune bool) ([]Hold, error) {
 	entries, err := os.ReadDir(s.holdsDir)
 	if err != nil {
 		if errors.Is(err, fs.ErrNotExist) {
@@ -297,17 +293,10 @@ func (s *Store) holds(includeStale bool) ([]Hold, error) {
 		path := filepath.Join(s.holdsDir, entry.Name())
 		hold, err := readHold(path)
 		if err != nil {
-			if includeStale {
-				holds = append(holds, Hold{Owner: strings.TrimSuffix(entry.Name(), ".json"), Stale: true})
-				continue
-			}
-			if err := os.Remove(path); err != nil && !errors.Is(err, fs.ErrNotExist) {
-				return nil, fmt.Errorf("remove unparsable hold %s: %w", path, err)
-			}
-			continue
+			return nil, fmt.Errorf("read hold: %w", err)
 		}
 		if !holdLive(hold) {
-			if includeStale {
+			if !prune {
 				hold.Stale = true
 				holds = append(holds, hold)
 				continue
@@ -339,20 +328,45 @@ func readHold(path string) (Hold, error) {
 //
 // The owner must already be a slug, and the stored Owner is that slug, so
 // listing holds reports the identity that was written and no two owners share a
-// file.
+// file. The write is atomic, so a reader sees the old hold or the complete new
+// one and a crash can never leave half a barrier behind.
 func (s *Store) AddHold(h Hold) error {
 	if !ValidSlug(h.Owner) {
 		return fmt.Errorf("invalid hold owner %q", h.Owner)
 	}
-	owner := h.Owner
-	h.Owner = owner
-
 	data, err := json.Marshal(h)
 	if err != nil {
 		return fmt.Errorf("encode hold: %w", err)
 	}
 	data = append(data, '\n')
-	return writeFileSync(filepath.Join(s.holdsDir, owner+".json"), data)
+	return writeFileAtomic(s.dir, filepath.Join(s.holdsDir, h.Owner+".json"), data)
+}
+
+// writeFileAtomic writes data to a temp file in dir, syncs it, renames it over
+// path, and syncs the directory that receives it. The temp lives outside the
+// destination directory, so a reader never lists a partial file.
+func writeFileAtomic(dir, path string, data []byte) error {
+	f, err := os.CreateTemp(dir, ".tmp-*")
+	if err != nil {
+		return fmt.Errorf("create temp for %s: %w", path, err)
+	}
+	tmp := f.Name()
+	defer func() { _ = os.Remove(tmp) }()
+	if _, err := f.Write(data); err != nil {
+		f.Close()
+		return fmt.Errorf("write %s: %w", tmp, err)
+	}
+	if err := f.Sync(); err != nil {
+		f.Close()
+		return fmt.Errorf("sync %s: %w", tmp, err)
+	}
+	if err := f.Close(); err != nil {
+		return fmt.Errorf("close %s: %w", tmp, err)
+	}
+	if err := os.Rename(tmp, path); err != nil {
+		return fmt.Errorf("replace %s: %w", path, err)
+	}
+	return syncdir(filepath.Dir(path))
 }
 
 // RemoveHold deletes owner's hold. Removing an absent hold is not an error.

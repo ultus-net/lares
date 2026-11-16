@@ -171,3 +171,10 @@ All notable changes to this project are recorded here. The format follows
   hold, then releases the lock. A pass that already holds the lock makes
   `hold exec` refuse before the command exists, so a repair or reboot can no
   longer run over the command in the unprotected interval before its hold.
+- A hold is written atomically: a temp file, an fsync, a rename, and a
+  directory fsync. A crash can no longer leave a torn hold that a later pass
+  treats as stale and deletes while the process it protects is still running.
+- A hold file that cannot be read or parsed fails the pass and the reboot gate.
+  lares no longer deletes a barrier it cannot understand. `status` and
+  `hold list` read holds without pruning them, so a read cannot remove a hold a
+  writer is publishing.
