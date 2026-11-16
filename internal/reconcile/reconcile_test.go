@@ -78,6 +78,7 @@ type harnessOptions struct {
 	family    adapter.Family
 	adapters  map[adapter.Family]adapter.Adapter
 	staged    func(context.Context) (bool, error)
+	runLog    func(item string, at time.Time, body []byte) (string, error)
 	notify    string
 	notifyErr error
 	reboot    bool
@@ -139,6 +140,7 @@ func newHarnessWith(t *testing.T, opts harnessOptions, script ...[]contract.Reco
 			h.sleeps = append(h.sleeps, d)
 			return nil
 		},
+		RunLog:  opts.runLog,
 		Session: func(context.Context) (bool, error) { return h.session, nil },
 		Train:   func(context.Context) (bool, error) { return h.train, nil },
 		Staged:  opts.staged,
@@ -499,6 +501,40 @@ func TestPassEscalatesWhenStateDoesNotMove(t *testing.T) {
 	}
 	if item.LastRunLog == "" {
 		t.Error("run log path not recorded")
+	}
+}
+
+// TestPassChargesAnAttemptWhenTheRunLogFails proves a repair that ran still
+// earns an attempt and a backoff when the pass aborts on the run log. Without
+// the charge, the next pass retries the same repair at the normal cadence.
+//
+// The run-log seam fails deterministically, so the case does not depend on the
+// uid or on filesystem permissions.
+func TestPassChargesAnAttemptWhenTheRunLogFails(t *testing.T) {
+	h := newHarnessWith(t, harnessOptions{
+		runLog: func(string, time.Time, []byte) (string, error) {
+			return "", errors.New("run log unavailable")
+		},
+	}, repoDrift())
+
+	if _, err := h.engine.Pass(context.Background()); err == nil {
+		t.Fatal("Pass succeeded with a failing run log")
+	}
+	if len(h.runs) != 1 {
+		t.Fatalf("ran %d commands, want 1: the attempt must be charged after the repair", len(h.runs))
+	}
+	item, ok := h.queued(t)["repo-demo"]
+	if !ok {
+		t.Fatal("the attempted item is missing from the queue")
+	}
+	if item.Attempts != 1 {
+		t.Errorf("attempts %d, want 1", item.Attempts)
+	}
+	if item.Term != term.DidNotHold {
+		t.Errorf("term %q, want %q", item.Term, term.DidNotHold)
+	}
+	if want := fixedNow.Add(15 * time.Minute); !item.NextAttemptAt.Equal(want) {
+		t.Errorf("next attempt %v, want %v", item.NextAttemptAt, want)
 	}
 }
 

@@ -209,8 +209,10 @@ person. Everything lares cannot prove queues rather than running.
 ## Backoff
 
 A failed converge increments `attempts` and sets `next_attempt_at` to now plus
-the resync interval doubled per attempt, capped at one day. A repair that cannot
-work costs one attempt per day, not one per resync.
+the resync interval doubled per attempt, capped at one day. The attempt is
+charged as soon as the repair runs, so a run-log write failure or a verification
+read failure still backs off and the pass then fails loudly. A repair that
+cannot work costs one attempt per day, not one per resync.
 
 A classified terminal push failure does not schedule a retry. It stays
 `needs-operator` with `blocked` until a measurement proves the item live, or the

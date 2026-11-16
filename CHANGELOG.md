@@ -189,3 +189,6 @@ All notable changes to this project are recorded here. The format follows
   holds a transaction. The daemon exits when idle, so its process alone is not
   the signal. An absent `rpm-ostree` is not a blocker on bootc and is an error
   on Fedora atomic.
+- A repair that ran charges one attempt even when the pass then fails on the run
+  log or a verification read. A broken log path no longer retries the repair at
+  every resync with no backoff.
