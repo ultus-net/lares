@@ -429,6 +429,36 @@ func (a *app) holdAdd(args []string) {
 	fmt.Printf("hold %s: %s\n", hold.Owner, hold.Reason)
 }
 
+// startProcess starts cmd. Tests replace it to observe the lock ordering.
+var startProcess = func(cmd *exec.Cmd) error { return cmd.Start() }
+
+// startUnderLock starts cmd while the state lock is held, then publishes the
+// hold that names the started pid, and only then releases the lock.
+//
+// A pass that holds the lock therefore never runs between the command's start
+// and its hold, and a pass already running makes this refuse before the command
+// exists. A command whose hold cannot be written is killed under the same lock,
+// so no pass can observe it running unheld.
+func (a *app) startUnderLock(cmd *exec.Cmd, reason string) (state.Hold, error) {
+	if err := a.store.Lock(); err != nil {
+		return state.Hold{}, err
+	}
+	if err := startProcess(cmd); err != nil {
+		_ = a.store.Unlock()
+		return state.Hold{}, err
+	}
+	owner := fmt.Sprintf("pid-%d", cmd.Process.Pid)
+	ticks, _ := state.ProcessStartTicks(cmd.Process.Pid)
+	hold := state.Hold{Owner: owner, Reason: reason, PID: cmd.Process.Pid, StartTicks: ticks, Start: time.Now()}
+	addErr := a.store.AddHold(hold)
+	if addErr != nil {
+		_ = cmd.Process.Kill()
+		_ = cmd.Wait()
+	}
+	_ = a.store.Unlock()
+	return hold, addErr
+}
+
 // holdExec runs a command under a hold that names the command's pid.
 //
 // The hold names the child rather than lares, so a lares crash still leaves the
@@ -448,23 +478,13 @@ func (a *app) holdExec(args []string) {
 
 	cmd := exec.Command(args[0], args[1:]...)
 	cmd.Stdin, cmd.Stdout, cmd.Stderr = os.Stdin, os.Stdout, os.Stderr
-	if err := cmd.Start(); err != nil {
+	hold, err := a.startUnderLock(cmd, strings.Join(args, " "))
+	if err != nil {
 		fmt.Fprintf(os.Stderr, "hold exec: %v\n", err)
 		os.Exit(3)
 	}
-	owner := fmt.Sprintf("pid-%d", cmd.Process.Pid)
-	ticks, _ := state.ProcessStartTicks(cmd.Process.Pid)
-	hold := state.Hold{Owner: owner, Reason: strings.Join(args, " "), PID: cmd.Process.Pid, StartTicks: ticks, Start: time.Now()}
-	if err := a.withLock(func() error { return a.store.AddHold(hold) }); err != nil {
-		// A hold that could not be written must not leave the command running
-		// unprotected while the operator believes it is held.
-		_ = cmd.Process.Kill()
-		_, _ = cmd.Process.Wait()
-		fmt.Fprintf(os.Stderr, "hold exec: %v\n", err)
-		os.Exit(3)
-	}
-	err := cmd.Wait()
-	if removeErr := a.withLock(func() error { return a.store.RemoveHold(owner) }); removeErr != nil {
+	err = cmd.Wait()
+	if removeErr := a.withLock(func() error { return a.store.RemoveHold(hold.Owner) }); removeErr != nil {
 		fmt.Fprintf(os.Stderr, "hold exec: release hold: %v\n", removeErr)
 	}
 	if err != nil {

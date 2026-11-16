@@ -164,3 +164,10 @@ All notable changes to this project are recorded here. The format follows
 - Sudoers generation. The installer never asks for a standing grant, so a
   repair that needs root stays queued.
 - `[s]etup` and `[c]lean` in the punch list, which had no handler.
+
+### Fixed
+
+- `hold exec` takes the state lock before it starts its command, publishes the
+  hold, then releases the lock. A pass that already holds the lock makes
+  `hold exec` refuse before the command exists, so a repair or reboot can no
+  longer run over the command in the unprotected interval before its hold.

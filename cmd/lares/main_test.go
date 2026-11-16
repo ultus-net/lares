@@ -9,6 +9,7 @@ import (
 	"os/exec"
 	"path/filepath"
 	"strings"
+	"syscall"
 	"testing"
 	"time"
 
@@ -359,6 +360,123 @@ func TestHoldExecHoldsAndReleases(t *testing.T) {
 	}
 	if len(entries) != 0 {
 		t.Errorf("%d holds left after the command exited", len(entries))
+	}
+}
+
+// TestStartUnderLockHoldsTheLockWhenTheCommandStarts proves the command starts
+// only while the lock is held, so a pass cannot run between the start and the
+// published hold.
+func TestStartUnderLockHoldsTheLockWhenTheCommandStarts(t *testing.T) {
+	c := newCLI(t)
+	store, err := state.Open(c.state)
+	if err != nil {
+		t.Fatalf("open state: %v", err)
+	}
+	a := &app{store: store}
+
+	var atStart error
+	previous := startProcess
+	startProcess = func(cmd *exec.Cmd) error {
+		probe, err := state.Open(c.state)
+		if err != nil {
+			return err
+		}
+		atStart = probe.Lock()
+		if atStart == nil {
+			_ = probe.Unlock()
+		}
+		return cmd.Start()
+	}
+	t.Cleanup(func() { startProcess = previous })
+
+	cmd := exec.Command("sh", "-c", "exit 0")
+	t.Cleanup(func() { _ = cmd.Wait() })
+	hold, err := a.startUnderLock(cmd, "sh -c exit 0")
+	if err != nil {
+		t.Fatalf("start under lock: %v", err)
+	}
+	if !errors.Is(atStart, state.ErrLocked) {
+		t.Errorf("the command started with lock error %v, want %v", atStart, state.ErrLocked)
+	}
+	if hold.PID != cmd.Process.Pid {
+		t.Errorf("hold pid %d, want the started pid %d", hold.PID, cmd.Process.Pid)
+	}
+}
+
+// TestStartUnderLockRefusesBeforeStartingWhenTheLockIsHeld proves a pass
+// already holding the lock stops hold exec before its command exists, so the
+// command never runs without a published hold.
+func TestStartUnderLockRefusesBeforeStartingWhenTheLockIsHeld(t *testing.T) {
+	c := newCLI(t)
+	other, err := state.Open(c.state)
+	if err != nil {
+		t.Fatalf("open state: %v", err)
+	}
+	if err := other.Lock(); err != nil {
+		t.Fatalf("hold the state lock: %v", err)
+	}
+	defer other.Unlock()
+
+	store, err := state.Open(c.state)
+	if err != nil {
+		t.Fatalf("open a second state handle: %v", err)
+	}
+	started := false
+	previous := startProcess
+	startProcess = func(cmd *exec.Cmd) error {
+		started = true
+		return cmd.Start()
+	}
+	t.Cleanup(func() { startProcess = previous })
+
+	a := &app{store: store}
+	cmd := exec.Command("sh", "-c", "exit 0")
+	if _, err := a.startUnderLock(cmd, "sh -c exit 0"); !errors.Is(err, state.ErrLocked) {
+		t.Fatalf("error %v, want %v", err, state.ErrLocked)
+	}
+	if started {
+		t.Error("the command started while another run held the lock")
+	}
+}
+
+// TestStartUnderLockKillsTheCommandWhenTheHoldCannotBeWritten proves the
+// failure path leaves no command running unheld and releases the lock.
+func TestStartUnderLockKillsTheCommandWhenTheHoldCannotBeWritten(t *testing.T) {
+	if os.Geteuid() == 0 {
+		t.Skip("a read-only directory does not stop root")
+	}
+	c := newCLI(t)
+	store, err := state.Open(c.state)
+	if err != nil {
+		t.Fatalf("open state: %v", err)
+	}
+	holdsDir := filepath.Join(c.state, "holds")
+	if err := os.Chmod(holdsDir, 0o500); err != nil {
+		t.Fatalf("make holds read-only: %v", err)
+	}
+	t.Cleanup(func() { _ = os.Chmod(holdsDir, 0o700) })
+
+	a := &app{store: store}
+	cmd := exec.Command("sh", "-c", "sleep 5")
+	if _, err := a.startUnderLock(cmd, "sh -c sleep 5"); err == nil {
+		t.Fatal("AddHold succeeded with a read-only holds directory")
+	}
+	if cmd.ProcessState == nil {
+		t.Fatal("the command was not reaped after the hold failed")
+	}
+	status, ok := cmd.ProcessState.Sys().(syscall.WaitStatus)
+	if !ok || !status.Signaled() {
+		t.Errorf("command exit %v, want a kill signal", cmd.ProcessState)
+	}
+
+	probe, err := state.Open(c.state)
+	if err != nil {
+		t.Fatalf("open a probe handle: %v", err)
+	}
+	if err := probe.Lock(); err != nil {
+		t.Errorf("the lock was left held after the failure: %v", err)
+	} else {
+		_ = probe.Unlock()
 	}
 }
 

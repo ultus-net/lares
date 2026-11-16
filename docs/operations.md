@@ -228,9 +228,13 @@ lares hold add --pid 4242 "import running outside lares"
 lares hold exec -- ./long-build.sh
 ```
 
-`hold exec` starts the command, writes a hold that names the command's pid, and
-removes it when the command exits. The hold names the child rather than lares,
-so a lares crash leaves the running command protected.
+`hold exec` takes the state lock, starts the command, writes a hold that names
+the command's pid, and only then releases the lock. A pass that already holds
+the lock makes `hold exec` refuse before the command exists, so no repair or
+reboot runs across the interval before a hold is published. If the hold cannot
+be written, the command is killed rather than left running unheld. The hold is
+removed when the command exits. The hold names the child rather than lares, so a
+lares crash leaves the running command protected.
 
 The owner is `pid-<pid>`, and a non-slug owner is rejected rather than
 rewritten, so two identities never share one file. A hold is stale when its pid
