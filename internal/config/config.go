@@ -1,11 +1,12 @@
 // Package config loads lares' top-level configuration.
 //
 // The file names an optional external probe, the state and config directories,
-// the repositories to check, an optional adapter override, the resync interval,
-// and the local-clock window in which a disruptive repair or a reboot may run. A
-// pass evaluates the reboot gate unless reboot_from_pass is false. There is no
-// host name and no machine-specific path in the defaults: lares measures the
-// host in-process and needs no checkout.
+// the repositories to check, an optional adapter override, the channel a new
+// finding is surfaced on, the resync interval, and the local-clock window in
+// which a disruptive repair or a reboot may run. A pass evaluates the reboot
+// gate unless reboot_from_pass is false. There is no host name and no
+// machine-specific path in the defaults: lares measures the host in-process and
+// needs no checkout.
 //
 // Load and Validate both leave Resync and Window set and parsed, so a caller
 // never reads ResyncText, WindowStart, or WindowEnd. Validate has a pointer
