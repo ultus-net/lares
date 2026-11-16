@@ -108,7 +108,13 @@ func (e *Engine) backupCheck(id, slug, dir string) check {
 		run: func(ctx context.Context) (contract.State, string, error) {
 			bs, err := e.readBackup(ctx, dir, slug)
 			if err != nil {
-				return pushState("backup", err)
+				var pe *PushError
+				if errors.As(err, &pe) {
+					return pushState("backup", err)
+				}
+				// A checkout that could not be read is unknown, never not-live.
+				// Only a classified git failure names a real backup state.
+				return contract.Unknown, "", err
 			}
 			if !bs.exists {
 				return contract.Stale, "no backup branch " + bs.target + "; push creates it", nil

@@ -339,6 +339,9 @@ func TestBackupCreatesOnAnEmptyRemote(t *testing.T) {
 
 func TestBackupPushesNoTagsOrNotes(t *testing.T) {
 	s := newScratch(t)
+	// Ambient config must not defeat the contract: with follow-tags on, the
+	// push has to override it rather than inherit it.
+	git(t, s.work, "config", "push.followTags", "true")
 	git(t, s.work, "tag", "-a", "v1", "-m", "release")
 	git(t, s.work, "notes", "add", "-m", "a note on HEAD")
 	if _, err := s.e.pushBackup(context.Background(), s.work, backupSlug); err != nil {
@@ -377,6 +380,9 @@ func TestBackupNeverForcesAndKeepsTheRefspec(t *testing.T) {
 		if strings.Contains(line, "--force") || strings.Contains(line, " push -f") {
 			t.Fatalf("push argv forces: %s", line)
 		}
+		if !strings.Contains(line, "-c push.followTags=false") {
+			t.Errorf("push argv does not override follow-tags: %s", line)
+		}
 		if refspec := argv[len(argv)-1]; refspec != backupTarget+":refs/heads/"+backupTarget {
 			t.Errorf("refspec %q, want the backup namespace only", refspec)
 		}
@@ -405,5 +411,44 @@ func TestBackupUsesGITSSHCommand(t *testing.T) {
 	}
 	if got := s.branch(t, backupTarget); got == "" {
 		t.Fatal("the push over ssh created no branch")
+	}
+}
+
+func TestBackupRefusesToRewindTheLocalBranch(t *testing.T) {
+	s := newScratch(t)
+	// Put a commit on the local backup branch that HEAD does not have. Moving
+	// that branch to HEAD would rewrite it, so the push must refuse.
+	git(t, s.work, "checkout", "-b", backupTarget)
+	s.commit(t, "local-only.txt")
+	git(t, s.work, "checkout", "main")
+
+	_, err := s.e.pushBackup(context.Background(), s.work, backupSlug)
+	var pe *PushError
+	if !errors.As(err, &pe) || pe.Kind != "precondition" {
+		t.Fatalf("push error %v, want a precondition PushError", err)
+	}
+	for _, name := range s.remoteBranches(t) {
+		if name == backupTarget {
+			t.Fatalf("the refused push created %s", name)
+		}
+	}
+}
+
+func TestBackupMeasureFailureIsUnknown(t *testing.T) {
+	s := newScratch(t)
+	inner := s.e.run
+	s.e.run = func(ctx context.Context, dir string, argv []string) ([]byte, error) {
+		if len(argv) > 1 && argv[1] == "status" {
+			return nil, errors.New("status unreadable")
+		}
+		return inner(ctx, dir, argv)
+	}
+	c := s.e.backupCheck("backup-"+backupSlug, backupSlug, s.work)
+	st, _, err := c.run(context.Background())
+	if err == nil {
+		t.Fatal("an unreadable checkout reported no error")
+	}
+	if st != contract.Unknown {
+		t.Fatalf("state %q, want unknown for an unreadable checkout", st)
 	}
 }

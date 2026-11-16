@@ -116,13 +116,12 @@ A push exit code alone is not evidence, the same way a version print is not
 evidence that a service is up.
 
 The push runs only when the checkout is clean, on a branch, the remote is
-reachable, no path is uncommitted, and no live hold exists. It never forces,
-never rewrites history, never deletes an unmerged branch, never pushes tags,
-notes, or refs outside the backup namespace, and never pushes to the remote's
-default branch. The default branch is read with `git ls-remote --symref
-<remote> HEAD`, so the refusal holds for `main`, `master`, `trunk`, or any other
-name. An empty remote reports no default branch, and the first backup may create
-its branch there.
+reachable, and no live hold exists. It never forces, never rewrites history,
+never deletes an unmerged branch, never pushes tags, notes, or refs outside the
+backup namespace, and never pushes to the remote's default branch. The default
+branch is read with `git ls-remote --symref <remote> HEAD`, so the refusal holds
+for `main`, `master`, `trunk`, or any other name. An empty remote reports no
+default branch, and the first backup may create its branch there.
 
 Failures are classified, never retried blind:
 
