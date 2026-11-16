@@ -317,6 +317,9 @@ notify = "auto"   # auto | desktop | stdout | off
 `auto` is the default. The journal keeps every notice, and a desktop session
 also gets a notification. On a headless host the journal line is the record.
 
+A `fix-did-not-hold` finding, and a blocked reboot, are sent to the desktop with
+`--urgency=critical`. Everything else is sent as normal urgency.
+
 Dedupe is by item id, state, and detail, stored in `notified.json` under the
 state lock. An identical failure is surfaced once. A changed detail is a new
 finding and is surfaced again. A finding that clears and returns is surfaced

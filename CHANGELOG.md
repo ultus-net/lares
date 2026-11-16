@@ -83,7 +83,8 @@ All notable changes to this project are recorded here. The format follows
   `auto` or `desktop` mode. `notify` in `config.toml` picks the mode and
   defaults to `auto`. Dedupe is keyed by item id, state, and detail in
   `notified.json`, written under the state lock, so a repeated identical failure
-  is silent and a changed detail is surfaced again. A desktop failure is
+  is silent and a changed detail is surfaced again. A `fix-did-not-hold` finding
+  and a blocked reboot are sent as critical urgency. A desktop failure is
   reported on stderr and never fails the pass.
 
 ### Changed
