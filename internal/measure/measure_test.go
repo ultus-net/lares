@@ -233,7 +233,7 @@ func TestSystemdFailed(t *testing.T) {
 		{"none", "", "", true, true, contract.Live, ""},
 		{"system", "foo.service loaded failed failed Broke\n", "", true, true, contract.NotLive, ""},
 		{"user", "", "bar.service loaded failed failed Broke\n", true, true, contract.NotLive, ""},
-		{"user unreadable", "", "", true, false, contract.Live, "user scope unreadable"},
+		{"user unreadable", "", "", true, false, contract.Unknown, "user scope unreadable"},
 		{"system unreadable", "", "bar.service loaded failed failed Broke\n", false, true, contract.NotLive, "system scope unreadable"},
 		{"both unreadable", "", "", false, false, contract.Unknown, ""},
 	}

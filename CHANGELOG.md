@@ -178,3 +178,14 @@ All notable changes to this project are recorded here. The format follows
   lares no longer deletes a barrier it cannot understand. `status` and
   `hold list` read holds without pruning them, so a read cannot remove a hold a
   writer is publishing.
+- An unreadable `/proc/<pid>/comm` or process start time fails the agent scan
+  and the Fedora train check instead of looking like a clear host. Only a
+  process that exited between the directory read and the file read is skipped.
+- A stay-awake marker that cannot be statted, or a home directory that cannot be
+  located, makes the session check report the host in use.
+- A partial `systemctl --failed` read is `unknown` when no scope reported a
+  failure, so an unreadable scope cannot hide a failed unit.
+- The Fedora train check asks `rpm-ostree status --json` whether the daemon
+  holds a transaction. The daemon exits when idle, so its process alone is not
+  the signal. An absent `rpm-ostree` is not a blocker on bootc and is an error
+  on Fedora atomic.

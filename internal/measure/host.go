@@ -108,16 +108,6 @@ func (e *Engine) archTrain() (contract.State, string, error) {
 	return contract.Live, fmt.Sprintf("stamp %s, updated %s ago", version, age), nil
 }
 
-// ostreeStatus is the deployment shape that rpm-ostree reports.
-type ostreeStatus struct {
-	Deployments []struct {
-		Booted   bool   `json:"booted"`
-		Staged   bool   `json:"staged"`
-		Version  string `json:"version"`
-		Checksum string `json:"checksum"`
-	} `json:"deployments"`
-}
-
 // bootcStatus is the deployment shape that bootc reports.
 type bootcStatus struct {
 	Status struct {
@@ -192,8 +182,8 @@ func deploymentName(version, checksum string) string {
 
 // parseOstree decodes an rpm-ostree status document.
 func parseOstree(out []byte) (contract.State, string, bool) {
-	var st ostreeStatus
-	if err := json.Unmarshal(out, &st); err != nil || len(st.Deployments) == 0 {
+	st, err := adapter.ParseRPMOstreeStatus(out)
+	if err != nil || len(st.Deployments) == 0 {
 		return "", "", false
 	}
 	booted := ""
@@ -251,10 +241,11 @@ func parseBootc(out []byte) (contract.State, string, bool) {
 
 // systemdCheck reports failed system and user units.
 //
-// An immutable composefs root cannot be remounted, so systemd-remount-fs fails
-// by design on Fedora atomic and bootc hosts with a read-only root. That unit
-// is excluded there and named in the detail, because no operator action can
-// clear it.
+// A scope that cannot be read makes the record unknown unless the other scope
+// reported a failure. An immutable composefs root cannot be remounted, so
+// systemd-remount-fs fails by design on Fedora atomic and bootc hosts with a
+// read-only root. That unit is excluded there and named in the detail, because
+// no operator action can clear it.
 func (e *Engine) systemdCheck() check {
 	return check{
 		id:   "systemd-failed",
@@ -303,6 +294,11 @@ func (e *Engine) systemdCheck() check {
 			}
 			if len(failed) > 0 {
 				return contract.NotLive, fmt.Sprintf("%d failed units (%s)%s", len(failed), strings.Join(firstN(failed, 3), ", "), note), nil
+			}
+			if len(unreadable) > 0 {
+				// A scope that did not answer could hold the failed unit, so a
+				// partial read cannot prove the host is clean.
+				return contract.Unknown, "could not read every scope; no failed units in the scopes that answered" + note, nil
 			}
 			return contract.Live, "no failed units" + note, nil
 		},
