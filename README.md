@@ -120,6 +120,11 @@ repos_dir = "/home/me/Documents/projects"
 window_start = "02:00"
 window_end = "05:00"
 resync = "15m"
+
+# Optional. auto prints the journal line and adds a desktop notification when a
+# session exists. auto | desktop | stdout | off
+# notify = "auto"
+
 reboot_from_pass = true
 ```
 
@@ -131,12 +136,17 @@ An external `audit_command` is an escape hatch for a measurement lares does not
 ship. Its records are queued and never repaired unattended, because lares did
 not produce the repair.
 
+`notify` decides how a new finding reaches a person, and dedupe is per item,
+state, and detail, so the same failure is surfaced once. The channels and the
+dedupe rule are in [docs/operations.md](docs/operations.md#notifications).
+
 ## State
 
 ```text
 ~/.local/state/lares/
 ├── verdicts.jsonl   append-only, one record per measure or deferral
 ├── queue.json       items awaiting judgement
+├── notified.json    the findings already surfaced to a person
 ├── holds/           one file per live hold
 ├── runs/            one log per converge, named by item and timestamp
 └── lock             the interprocess lock a pass and a reboot share

@@ -89,6 +89,8 @@ All notable changes to this project are recorded here. The format follows
 
 ### Changed
 
+- The README names `notify` and the `notified.json` state file, which the
+  notification step added to the config and the state directory.
 - REQUIREMENT (operator, 2026-11-16): pushes are mandatory. This supersedes the
   earlier in-repo rule that lares never pushes. A local-only commit is not
   backed up, so every clean checkout now syncs to `backup/<host>/<repo>`. The
